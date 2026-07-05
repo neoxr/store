@@ -66,6 +66,9 @@ class Store {
    private chatsCache = new Map<string, any>()
    private chatsProxyInstance: Record<string, any>
 
+   private maxCachedContacts = 5000
+   private maxCachedChats = 1000
+
    constructor(dir: string = 'stores', max: number = 250, uri?: string) {
       this.client = null
       this.storeDir = path.join(process.cwd(), '.cache', dir)
@@ -90,7 +93,13 @@ class Store {
    private toPOJO(obj: any, seen = new WeakSet()): any {
       if (obj === null || typeof obj !== 'object') return obj
       if (seen.has(obj)) return null
-      if (Buffer.isBuffer(obj) || obj instanceof Uint8Array) return obj
+
+      if (Buffer.isBuffer(obj)) {
+         return Buffer.from(obj)
+      }
+      if (obj instanceof Uint8Array) {
+         return new Uint8Array(obj)
+      }
 
       seen.add(obj)
 
@@ -99,7 +108,9 @@ class Store {
       }
 
       const res: any = {}
-      for (const key of Object.keys(obj)) {
+      const keys = Object.keys(obj)
+      for (let i = 0; i < keys.length; i++) {
+         const key = keys[i]
          const val = obj[key]
          if (typeof val !== 'function') {
             res[key] = this.toPOJO(val, seen)
@@ -239,6 +250,12 @@ class Store {
             if (typeof prop !== 'string') return false
             const cleanedValue = self.toPOJO(value)
             self.chatsCache.set(prop, cleanedValue)
+
+            if (self.chatsCache.size > self.maxCachedChats) {
+               const firstKey = self.chatsCache.keys().next().value
+               if (firstKey) self.chatsCache.delete(firstKey)
+            }
+
             if (self.pool) {
                self.pool.query('INSERT INTO chats (id, data, updated_at) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at', [prop, stringify(cleanedValue), Date.now()]).catch(() => { })
             } else if (self.fallbackChats) {
@@ -264,6 +281,12 @@ class Store {
             if (typeof prop !== 'string') return false
             const cleanedValue = self.toPOJO(value)
             self.contactsCache.set(prop, cleanedValue)
+
+            if (self.contactsCache.size > self.maxCachedContacts) {
+               const firstKey = self.contactsCache.keys().next().value
+               if (firstKey) self.contactsCache.delete(firstKey)
+            }
+
             if (self.pool) {
                self.pool.query('INSERT INTO contacts (jid, data, updated_at) VALUES ($1, $2, $3) ON CONFLICT (jid) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at', [prop, stringify(cleanedValue), Date.now()]).catch(() => { })
             } else if (self.fallbackContacts) {
@@ -321,14 +344,15 @@ class Store {
       if (this.cache.has(jid)) return this.cache.get(jid)!
       if (!this.pool) return []
       try {
-         const limitVal = this.max > 100 ? 100 : this.max
          const { rows }: any = await this.pool.query(
             'SELECT data FROM messages WHERE jid = $1 ORDER BY created_at DESC LIMIT $2',
-            [jid, limitVal]
+            [jid, this.max]
          )
          const data = rows.map((row: any) => parse(row.data) as WAMessage).reverse()
          this.cache.set(jid, data)
-         if (this.cache.size > this.maxCachedJids) this.cache.delete(this.cache.keys().next().value)
+         if (this.cache.size > this.maxCachedJids) {
+            this.cache.delete(this.cache.keys().next().value)
+         }
          return data
       } catch {
          return []
@@ -336,6 +360,12 @@ class Store {
    }
 
    public async loadMessage(jid: string, id: string): Promise<WAMessage | null> {
+      if (this.cache.has(jid)) {
+         const list = this.cache.get(jid)!
+         const found = list.find(v => v.key?.id === id || (v as any).id === id)
+         if (found) return found
+      }
+
       if (this.pool) {
          try {
             const { rows }: any = await this.pool.query('SELECT data FROM messages WHERE jid = $1 AND id = $2', [jid, id])
@@ -349,6 +379,13 @@ class Store {
    }
 
    public async loadMessages(jid: string, count: number = 25): Promise<WAMessage[] | null> {
+      if (this.cache.has(jid)) {
+         const list = this.cache.get(jid)!
+         if (list.length > 0) {
+            return [...list].reverse().slice(0, count)
+         }
+      }
+
       if (this.pool) {
          try {
             const { rows }: any = await this.pool.query(
@@ -380,13 +417,12 @@ class Store {
                      'INSERT INTO messages (jid, id, data, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT (jid, id) DO UPDATE SET data = EXCLUDED.data, created_at = EXCLUDED.created_at',
                      [jid, msgId, stringify(cleanedMsg), Date.now()]
                   )
-                  const { rows }: any = await this.pool.query('SELECT COUNT(*) as count FROM messages WHERE jid = $1', [jid])
-                  const count = parseInt(rows[0]?.count || '0', 10)
-                  if (count > this.max) {
-                     await this.pool.query(
-                        'DELETE FROM messages WHERE jid = $1 AND id NOT IN (SELECT id FROM messages WHERE jid = $2 ORDER BY created_at DESC LIMIT $3)',
-                        [jid, jid, this.max]
-                     )
+                  
+                  if (Math.random() < 0.1) {
+                     this.pool.query(
+                        'DELETE FROM messages WHERE jid = $1 AND id NOT IN (SELECT id FROM messages WHERE jid = $1 ORDER BY created_at DESC LIMIT $2)',
+                        [jid, this.max]
+                     ).catch(() => { })
                   }
                } catch { }
             })
@@ -400,7 +436,7 @@ class Store {
          if (this.cache.has(jid)) {
             const list = this.cache.get(jid)!
             list.push(msg)
-            if (list.length > 100) list.shift()
+            if (list.length > this.max) list.shift()
          }
          return
       }
@@ -421,17 +457,9 @@ class Store {
       let list: WAMessage[] = []
 
       if (this.pool) {
-         try {
-            const { rows }: any = await this.pool.query(
-               'SELECT data FROM messages WHERE jid = $1 ORDER BY created_at DESC LIMIT $2',
-               [jid, this.max]
-            )
-            list = rows.map((row: any) => parse(row.data) as WAMessage).reverse()
-         } catch {
-            list = []
-         }
-      } else {
          list = await this.getPGData(jid)
+      } else {
+         list = this.fallbackStore?.[jid] || []
       }
 
       const sliced = list.slice(offset)
@@ -619,7 +647,7 @@ class Store {
                const { rows: res }: any = await this.pool.query(
                   'SELECT data FROM stories WHERE jid = $1 ORDER BY created_at DESC LIMIT $2',
                   [jid, count]
-               )
+                )
                rows = res
             } else {
                const { rows: res }: any = await this.pool.query(
@@ -720,7 +748,7 @@ class Store {
                const currentList = this.stories[jid] || []
                if (offset < currentList.length) {
                   this.stories[jid] = currentList.slice(0, offset)
-                }
+               }
             }
          }
       }
@@ -765,11 +793,17 @@ class Store {
 
       const now = Date.now()
       this.messageId.forEach((instanceMap, instance) => {
-         instanceMap.forEach((value, msgId) => {
-            if (now - value.at > 900000) instanceMap.delete(msgId)
-         })
+         for (const [msgId, value] of instanceMap.entries()) {
+            if (now - value.at > 900000) {
+               instanceMap.delete(msgId)
+            } else {
+               break
+            }
+         }
          if (instanceMap.size === 0) this.messageId.delete(instance)
       })
+
+      this.presences = Object.create(null)
 
       if (this.pool) {
          this.pool.query('DELETE FROM stories WHERE created_at < $1', [now - 86400000]).catch(() => { })
