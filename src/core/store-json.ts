@@ -10,7 +10,11 @@ class Store {
    public database: string
 
    private cache = new Map<string, WAMessage[]>()
-   private maxCachedJids = 10
+   private readonly maxCachedJids = 10
+   private readonly maxCachedChats = 500
+   private readonly maxCachedContacts = 1000
+   private readonly maxCachedStoryJids = 250
+   private cleanupTimer: NodeJS.Timeout
    private pendingJidWrites = new Set<string>()
    private writeQueues = new Map<string, Promise<any>>()
    private fallbackStore: Record<string, WAMessage[]> | null = null
@@ -56,7 +60,66 @@ class Store {
       this.loadContacts()
       this.loadStoriesData()
 
-      setInterval(() => this.cleanupExpiredMessages(), 120000)
+      this.cleanupTimer = setInterval(() => this.cleanupExpiredMessages(), 120000)
+      this.cleanupTimer.unref?.()
+   }
+
+
+   private schedule(delay: number, fn: () => void): void {
+      const timer = setTimeout(fn, delay)
+      timer.unref?.()
+   }
+
+   private pruneMapByUpdatedAt<T extends Record<string, any>>(map: Map<string, T>, maxSize: number): void {
+      if (map.size <= maxSize) return
+
+      const overflow = map.size - maxSize
+      const candidates = Array.from(map.entries())
+         .sort((a, b) => (a[1]?.updated_at || 0) - (b[1]?.updated_at || 0))
+         .slice(0, overflow)
+
+      for (const [key] of candidates) {
+         map.delete(key)
+      }
+   }
+
+   private pruneStoriesCache(now: number = Date.now()): boolean {
+      let updated = false
+      const twentyFourHoursAgo = now - 86400000
+
+      for (const [jid, list] of this.storiesCache.entries()) {
+         const filtered = list.filter((story: any) => (story.created_at || story.messageTimestamp || now) > twentyFourHoursAgo)
+         if (filtered.length !== list.length) {
+            if (filtered.length === 0) {
+               this.storiesCache.delete(jid)
+            } else {
+               this.storiesCache.set(jid, filtered)
+            }
+            updated = true
+         }
+      }
+
+      if (this.storiesCache.size > this.maxCachedStoryJids) {
+         const overflow = this.storiesCache.size - this.maxCachedStoryJids
+         const candidates = Array.from(this.storiesCache.entries())
+            .map(([jid, list]) => {
+               let newest = 0
+               for (const story of list) {
+                  const timestamp = story.created_at || story.messageTimestamp || 0
+                  if (timestamp > newest) newest = timestamp
+               }
+               return [jid, newest] as const
+            })
+            .sort((a, b) => a[1] - b[1])
+            .slice(0, overflow)
+
+         for (const [jid] of candidates) {
+            this.storiesCache.delete(jid)
+            updated = true
+         }
+      }
+
+      return updated
    }
 
    private toPOJO(obj: any, seen = new WeakSet()): any {
@@ -149,8 +212,9 @@ class Store {
       if (this.chatsPendingWrite) return
       this.chatsPendingWrite = true
 
-      setTimeout(() => {
+      this.schedule(2000, () => {
          this.chatsPendingWrite = false
+         this.pruneMapByUpdatedAt(this.chatsCache, this.maxCachedChats)
          const list = this.toPOJO(Array.from(this.chatsCache.values()))
 
          this.enqueueWrite('chats', async () => {
@@ -162,15 +226,16 @@ class Store {
                console.error('[store-json] Failed to write chats to disk:', error)
             }
          })
-      }, 2000)
+      })
    }
 
    private writeContacts(): void {
       if (this.contactsPendingWrite) return
       this.contactsPendingWrite = true
 
-      setTimeout(() => {
+      this.schedule(2000, () => {
          this.contactsPendingWrite = false
+         this.pruneMapByUpdatedAt(this.contactsCache, this.maxCachedContacts)
          const list = this.toPOJO(Array.from(this.contactsCache.values()))
 
          this.enqueueWrite('contacts', async () => {
@@ -182,15 +247,16 @@ class Store {
                console.error('[store-json] Failed to write contacts to disk:', error)
             }
          })
-      }, 2000)
+      })
    }
 
    private writeStoriesData(): void {
       if (this.storiesPendingWrite) return
       this.storiesPendingWrite = true
 
-      setTimeout(() => {
+      this.schedule(2000, () => {
          this.storiesPendingWrite = false
+         this.pruneStoriesCache()
          const obj: Record<string, any[]> = {}
          for (const [jid, list] of this.storiesCache.entries()) {
             obj[jid] = list
@@ -206,7 +272,7 @@ class Store {
                console.error('[store-json] Failed to write stories to disk:', error)
             }
          })
-      }, 2000)
+      })
    }
 
    public config({ dir, max }: StoreConfig): this {
@@ -242,6 +308,7 @@ class Store {
             const cleanedValue = self.toPOJO(value)
             cleanedValue.updated_at = Date.now()
             self.chatsCache.set(prop, cleanedValue)
+            self.pruneMapByUpdatedAt(self.chatsCache, self.maxCachedChats)
             self.writeChats()
             return true
          },
@@ -264,6 +331,7 @@ class Store {
             const cleanedValue = self.toPOJO(value)
             cleanedValue.updated_at = Date.now()
             self.contactsCache.set(prop, cleanedValue)
+            self.pruneMapByUpdatedAt(self.contactsCache, self.maxCachedContacts)
             self.writeContacts()
             return true
          },
@@ -370,7 +438,7 @@ class Store {
       if (this.pendingJidWrites.has(jid)) return
       this.pendingJidWrites.add(jid)
 
-      setTimeout(() => {
+      this.schedule(1500, () => {
          this.pendingJidWrites.delete(jid)
          const currentData = this.cache.get(jid)
          if (!currentData) return
@@ -388,7 +456,7 @@ class Store {
                console.error(`[store-json] Failed to write JID ${jid} to JSON:`, error)
             }
          })
-      }, 1500)
+      })
    }
 
    public loadMessage(jid: string, id: string): WAMessage | null {
@@ -492,7 +560,13 @@ class Store {
    public getContact(id: string): Contact | null {
       if (!id) return null
       if (this.contacts[id]) return this.contacts[id]
-      const found = Object.values(this.contacts).find((c: any) => c.id === id || c.jid === id || c.sender_pn === id)
+      let found: Contact | undefined
+      for (const c of this.contactsCache.values()) {
+         if ((c as any).id === id || (c as any).jid === id || (c as any).sender_pn === id) {
+            found = c
+            break
+         }
+      }
       return found || null
    }
 
@@ -648,22 +722,7 @@ class Store {
          if (instanceMap.size === 0) this.messageId.delete(instance)
       })
 
-      let storiesUpdated = false
-      const twentyFourHoursAgo = now - 86400000
-
-      for (const [jid, list] of this.storiesCache.entries()) {
-         const filtered = list.filter((story: any) => (story.created_at || story.messageTimestamp || now) > twentyFourHoursAgo)
-         if (filtered.length !== list.length) {
-            if (filtered.length === 0) {
-               this.storiesCache.delete(jid)
-            } else {
-               this.storiesCache.set(jid, filtered)
-            }
-            storiesUpdated = true
-         }
-      }
-
-      if (storiesUpdated) {
+      if (this.pruneStoriesCache(now)) {
          this.writeStoriesData()
       }
    }
