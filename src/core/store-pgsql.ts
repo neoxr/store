@@ -90,15 +90,29 @@ class Store {
       setInterval(() => this.cleanupExpiredMessages(), 120000)
    }
 
+   /**
+    * PENTING: Buffer/Uint8Array di sini langsung dikonversi ke base64 string, BUKAN
+    * di-clone sebagai Buffer.
+    *
+    * Alasannya: Buffer di Node punya method `toJSON()` bawaan yang otomatis dipanggil
+    * oleh JSON.stringify SEBELUM replacer sempat melihat valuenya. toJSON() itu mengubah
+    * buffer jadi array angka biasa (mis. thumbnail 20KB -> array ~20000 elemen, tiap elemen
+    * makan ~8-16 byte di V8 -> bisa 200-300KB+ hanya untuk representasi sementara).
+    * Kalau kita sudah kasih base64 string dari sini, JSON.stringify tidak akan pernah
+    * memicu ledakan memori itu karena string biasa tidak lewat toJSON.
+    *
+    * Ini TIDAK menghapus data apa pun (jpegThumbnail dkk tetap utuh, cuma beda representasi),
+    * jadi saat di-load lagi lewat `parse()`/reviver, hasilnya balik jadi Buffer seperti semula.
+    */
    private toPOJO(obj: any, seen = new WeakSet()): any {
       if (obj === null || typeof obj !== 'object') return obj
       if (seen.has(obj)) return null
 
       if (Buffer.isBuffer(obj)) {
-         return Buffer.from(obj)
+         return { type: 'Buffer', data: obj.toString('base64') }
       }
       if (obj instanceof Uint8Array) {
-         return new Uint8Array(obj)
+         return { type: 'Buffer', data: Buffer.from(obj).toString('base64') }
       }
 
       seen.add(obj)
@@ -417,9 +431,9 @@ class Store {
                      'INSERT INTO messages (jid, id, data, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT (jid, id) DO UPDATE SET data = EXCLUDED.data, created_at = EXCLUDED.created_at',
                      [jid, msgId, stringify(cleanedMsg), Date.now()]
                   )
-                  
+
                   if (Math.random() < 0.1) {
-                     this.pool.query(
+                     await this.pool.query(
                         'DELETE FROM messages WHERE jid = $1 AND id NOT IN (SELECT id FROM messages WHERE jid = $1 ORDER BY created_at DESC LIMIT $2)',
                         [jid, this.max]
                      ).catch(() => { })
@@ -647,7 +661,7 @@ class Store {
                const { rows: res }: any = await this.pool.query(
                   'SELECT data FROM stories WHERE jid = $1 ORDER BY created_at DESC LIMIT $2',
                   [jid, count]
-                )
+               )
                rows = res
             } else {
                const { rows: res }: any = await this.pool.query(
@@ -771,7 +785,11 @@ class Store {
          this.messageId.set(instance, instanceMap)
       }
 
-      if (instanceMap.has(id) && !msg.updated) return false
+      // PERBAIKAN 3.1: Hapus key terlebih dahulu untuk mereset "insertion order" Map jika ada pembaruan data
+      if (instanceMap.has(id)) {
+         if (!msg.updated) return false
+         instanceMap.delete(id)
+      }
 
       instanceMap.set(id, { at: Date.now() })
 
@@ -803,7 +821,9 @@ class Store {
          if (instanceMap.size === 0) this.messageId.delete(instance)
       })
 
-      this.presences = Object.create(null)
+      for (const key of Object.keys(this.presences)) {
+         delete this.presences[key]
+      }
 
       if (this.pool) {
          this.pool.query('DELETE FROM stories WHERE created_at < $1', [now - 86400000]).catch(() => { })
