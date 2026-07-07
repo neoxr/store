@@ -1,4 +1,4 @@
-import { type Contact, type ConnectionState, type PresenceData, BotClient, WAMessage, StoreConfig } from '../interface.js'
+import { type Contact, type ConnectionState, type PresenceData, Client, WAMessage, StoreConfig } from '../interface.js'
 import path from 'node:path'
 import { noSuffix, getKeyAuthor } from '../utils.js'
 
@@ -40,7 +40,9 @@ const stringify = (obj: any) => JSON.stringify(obj, BufferJSON.replacer)
 const parse = (str: string) => JSON.parse(str, BufferJSON.reviver)
 
 class Store {
-   public client: BotClient | null
+   public client: Client | null
+   public socket: any | null
+
    public storeDir: string
    public max: number
    public uri: string | undefined
@@ -71,6 +73,8 @@ class Store {
 
    constructor(dir: string = 'stores', max: number = 250, uri?: string) {
       this.client = null
+      this.socket = null
+
       this.storeDir = path.join(process.cwd(), '.cache', dir)
       this.max = max
       this.uri = uri || process.env.USE_STORE
@@ -323,8 +327,9 @@ class Store {
       return this.contactsProxyInstance
    }
 
-   public bind<T extends BotClient>(client: T): T {
+   public bind<T extends Client>(client: T, socket: any): T {
       this.client = client
+      this.socket = socket
 
       client.loadMessage = this.loadMessage.bind(this)
       client.loadMessages = this.loadMessages.bind(this)
@@ -525,9 +530,9 @@ class Store {
       for (const contact of newContacts) {
          const id = noSuffix(contact.id)
          let jid = id
-         if (this.client && jid?.endsWith('lid')) {
+         if (this.socket && jid?.endsWith('lid')) {
             // @ts-ignore
-            jid = this.client?.getJidFromJSON(jid)?.jid ?? id
+            jid = this.socket?.decodeJid(this.socket?.signalRepository.lidMapping.getPNForLID(jid)) ?? id
          }
          oldContacts.delete(jid)
          this.contacts[jid] = Object.assign(this.contacts[jid] || { jid }, contact)
@@ -540,9 +545,9 @@ class Store {
          if (update.id) {
             const id = noSuffix(update.id)
             let jid = id
-            if (this.client && jid?.endsWith('lid')) {
+            if (this.socket && jid?.endsWith('lid')) {
                // @ts-ignore
-               jid = this.client?.getJidFromJSON(jid)?.jid ?? id
+               jid = this.socket?.decodeJid(this.socket?.signalRepository.lidMapping.getPNForLID(jid)) ?? id
             }
             this.contacts[jid] = Object.assign(this.contacts[jid] || { jid, id: jid }, update)
          }

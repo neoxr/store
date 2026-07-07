@@ -1,4 +1,4 @@
-import { type Contact, type ConnectionState, type PresenceData, BotClient, WAMessage, StoreConfig } from '../interface.js'
+import { type Contact, type ConnectionState, type PresenceData, Client, WAMessage, StoreConfig } from '../interface.js'
 import path from 'node:path'
 import { noSuffix, getKeyAuthor } from '../utils.js'
 
@@ -16,7 +16,7 @@ const loadMongo = async () => {
 }
 
 class Store {
-   public client: BotClient | null
+   public client: Client | null
    public storeDir: string
    public max: number
    public uri: string | undefined
@@ -220,7 +220,7 @@ class Store {
       return this.contactsProxyInstance
    }
 
-   public bind<T extends BotClient>(client: T): T {
+   public bind<T extends Client>(client: T): T {
       this.client = client
 
       client.loadMessage = this.loadMessage.bind(this)

@@ -48,7 +48,7 @@ export type ConnectionState = {
    isOnline?: boolean
 }
 
-export interface BotClient {
+export interface Client {
    loadMessage?: (jid: string, id: string) => WAMessage | Promise<WAMessage | null> | null
    loadMessages?: (jid: string, count?: number) => WAMessage[] | Promise<WAMessage[] | null> | null
    addMessage?: (jid: string, msg: WAMessage) => void | Promise<void>
