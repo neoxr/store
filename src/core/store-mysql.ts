@@ -41,6 +41,7 @@ const parse = (str: string) => JSON.parse(str, BufferJSON.reviver)
 
 class Store {
    public client: Client | null
+   public socket: any | null
    public storeDir: string
    public max: number
    public uri: string | undefined
@@ -68,6 +69,7 @@ class Store {
 
    constructor(dir: string = 'stores', max: number = 250, uri?: string) {
       this.client = null
+      this.socket = null
       this.storeDir = path.join(process.cwd(), '.cache', dir)
       this.max = max
       this.uri = uri || process.env.USE_STORE
@@ -87,10 +89,21 @@ class Store {
       setInterval(() => this.cleanupExpiredMessages(), 120000)
    }
 
+   /**
+    * Converts Buffers and Uint8Arrays to base64 objects early.
+    * This prevents JSON.stringify from calling the native toJSON() method on Buffers,
+    * which expands binary data into massive numeric arrays in memory, causing RSS spikes.
+    */
    private toPOJO(obj: any, seen = new WeakSet()): any {
       if (obj === null || typeof obj !== 'object') return obj
       if (seen.has(obj)) return null
-      if (Buffer.isBuffer(obj) || obj instanceof Uint8Array) return obj
+
+      if (Buffer.isBuffer(obj)) {
+         return { type: 'Buffer', data: obj.toString('base64') }
+      }
+      if (obj instanceof Uint8Array) {
+         return { type: 'Buffer', data: Buffer.from(obj).toString('base64') }
+      }
 
       seen.add(obj)
 
@@ -99,7 +112,9 @@ class Store {
       }
 
       const res: any = {}
-      for (const key of Object.keys(obj)) {
+      const keys = Object.keys(obj)
+      for (let i = 0; i < keys.length; i++) {
+         const key = keys[i]
          const val = obj[key]
          if (typeof val !== 'function') {
             res[key] = this.toPOJO(val, seen)
@@ -108,6 +123,9 @@ class Store {
       return res
    }
 
+   /**
+    * Initializes the MySQL connection pool and creates all database schemas if not exist.
+    */
    private async initDB(): Promise<void> {
       const mysql = await loadMySQL()
 
@@ -197,6 +215,9 @@ class Store {
       }
    }
 
+   /**
+    * Preloads dynamic chats from database into the active memory cache.
+    */
    private async preloadChats(): Promise<void> {
       if (!this.pool) return
       try {
@@ -209,6 +230,9 @@ class Store {
       }
    }
 
+   /**
+    * Preloads dynamic contacts from database into the active memory cache.
+    */
    private async preloadContacts(): Promise<void> {
       if (!this.pool) return
       try {
@@ -221,6 +245,9 @@ class Store {
       }
    }
 
+   /**
+    * Configures directories, capacities, and triggers database re-initialization if URI changes.
+    */
    public config({ dir, max, uri }: StoreConfig): this {
       let needsReinit = false
 
@@ -244,6 +271,9 @@ class Store {
       return this
    }
 
+   /**
+    * Creates a proxy handler to manage cache updates and auto-syncing chat records to MySQL.
+    */
    private createChatsProxy(): Record<string, any> {
       const self = this
       return new Proxy(Object.create(null), {
@@ -269,6 +299,9 @@ class Store {
       }) as Record<string, any>
    }
 
+   /**
+    * Creates a proxy handler to manage cache updates and auto-syncing contact records to MySQL.
+    */
    private createContactsProxy(): Record<string, Contact> {
       const self = this
       return new Proxy(Object.create(null), {
@@ -302,8 +335,12 @@ class Store {
       return this.contactsProxyInstance
    }
 
-   public bind<T extends Client>(client: T): T {
+   /**
+    * Binds active client and socket connections to the store module.
+    */
+   public bind<T extends Client>(client: T, socket: any): T {
       this.client = client
+      this.socket = socket
 
       client.loadMessage = this.loadMessage.bind(this)
       client.loadMessages = this.loadMessages.bind(this)
@@ -333,6 +370,9 @@ class Store {
       return client
    }
 
+   /**
+    * Internal helper to load raw messages history of a JID directly from MySQL connection pool.
+    */
    private async getMySQLData(jid: string): Promise<WAMessage[]> {
       if (this.cache.has(jid)) return this.cache.get(jid)!
       if (!this.pool) return []
@@ -351,6 +391,9 @@ class Store {
       }
    }
 
+   /**
+    * Loads a single message based on JID and message ID.
+    */
    public async loadMessage(jid: string, id: string): Promise<WAMessage | null> {
       if (this.pool) {
          try {
@@ -364,6 +407,9 @@ class Store {
       return list.find(v => v.key?.id === id || (v as any).id === id) || null
    }
 
+   /**
+    * Loads list of messages associated with a JID up to a specific limit.
+    */
    public async loadMessages(jid: string, count: number = 25): Promise<WAMessage[] | null> {
       if (this.pool) {
          try {
@@ -382,6 +428,9 @@ class Store {
       return [...list].reverse().slice(0, count)
    }
 
+   /**
+    * Saves a message and schedules background table pruning inside write queues.
+    */
    public async addMessage(jid: string, msg: WAMessage): Promise<void> {
       const msgId = msg.key?.id || (msg as any).id
       if (!msgId) return
@@ -437,6 +486,9 @@ class Store {
       }
    }
 
+   /**
+    * Fetches all message history associated with a JID using an offset constraint.
+    */
    public async getAllMessages(jid: string, offset: number = 0) {
       let list: WAMessage[] = []
 
@@ -489,6 +541,9 @@ class Store {
       })
    }
 
+   /**
+    * Handles partial or full updates on active chat structures.
+    */
    public chatUpdate(updates: any[]): void {
       for (const update of updates) {
          if (update.id) {
@@ -498,14 +553,17 @@ class Store {
       }
    }
 
+   /**
+    * Upserts contact arrays and resolves JID targets with the socket instance mapping.
+    */
    public contactsUpsert(newContacts: Contact[]): Set<string> {
       const oldContacts = new Set(Object.keys(this.contacts))
       for (const contact of newContacts) {
          const id = noSuffix(contact.id)
          let jid = id
-         if (this.client && jid?.endsWith('lid')) {
+         if (this.socket && jid?.endsWith('lid')) {
             // @ts-ignore
-            jid = this.client?.getJidFromJSON(jid)?.jid ?? id
+            jid = this.socket?.decodeJid(this.socket?.signalRepository.lidMapping.getPNForLID(jid)) ?? id
          }
          oldContacts.delete(jid)
          this.contacts[jid] = Object.assign(this.contacts[jid] || { jid }, contact)
@@ -513,20 +571,26 @@ class Store {
       return oldContacts
    }
 
+   /**
+    * Processes structural updates on dynamic contacts and maintains LID-to-PN associations.
+    */
    public contactUpdate(updates: any[]): void {
       for (const update of updates) {
          if (update.id) {
             const id = noSuffix(update.id)
             let jid = id
-            if (this.client && jid?.endsWith('lid')) {
+            if (this.socket && jid?.endsWith('lid')) {
                // @ts-ignore
-               jid = this.client?.getJidFromJSON(jid)?.jid ?? id
+               jid = this.socket?.decodeJid(this.socket?.signalRepository.lidMapping.getPNForLID(jid)) ?? id
             }
             this.contacts[jid] = Object.assign(this.contacts[jid] || { jid, id: jid }, update)
          }
       }
    }
 
+   /**
+    * Fetches a contact structure using exact JID, ID, or phoneNumber identifiers.
+    */
    public getContact(id: string): Contact | null {
       if (!id) return null
       if (this.contacts[id]) return this.contacts[id]
@@ -534,6 +598,9 @@ class Store {
       return found || null
    }
 
+   /**
+    * Resolves lists of contacts alongside contextual cleaning and counting helper methods.
+    */
    public getAllContacts(offset: number = 0) {
       const list = Object.values(this.contacts)
       const sliced = (offset > 0 ? list.slice(offset) : list) as any[] & { count(): number; clear(): void }
@@ -558,6 +625,9 @@ class Store {
       return sliced
    }
 
+   /**
+    * Updates a message structure by merging incoming status receipts and updates active queues.
+    */
    public async updateMessageWithReceipt(msg: any, receipt: any): Promise<void> {
       if (!msg) return
       msg.userReceipt = msg.userReceipt || []
@@ -595,6 +665,9 @@ class Store {
       }
    }
 
+   /**
+    * Updates a message structure by merging dynamic user reactions and updates active queues.
+    */
    public async updateMessageWithReaction(msg: any, reaction: any): Promise<void> {
       if (!msg) return
       const authorID = getKeyAuthor(reaction.key)
@@ -631,6 +704,9 @@ class Store {
       }
    }
 
+   /**
+    * Loads story data associated with a JID up to a given limit.
+    */
    public async loadStories(jid: string, count?: number): Promise<any[] | null> {
       if (this.pool) {
          try {
@@ -660,6 +736,9 @@ class Store {
       return [...slice].reverse()
    }
 
+   /**
+    * Loads a single story entry based on its identifiers.
+    */
    public async loadStory(jid: string, id: string): Promise<any | null> {
       if (this.pool) {
          try {
@@ -674,6 +753,9 @@ class Store {
       return list.find((v: any) => v.key?.id === id || v.id === id) || null
    }
 
+   /**
+    * Saves a single story structure and truncates standard memory bounds.
+    */
    public async addStory(jid: string, story: any): Promise<void> {
       const storyId = story.key?.id || story.id
       if (!storyId) return
@@ -698,6 +780,9 @@ class Store {
       }
    }
 
+   /**
+    * Retrieves all stories associated with a JID using offset-based listings.
+    */
    public async getAllStories(jid: string, offset: number = 0) {
       let list: any[] = []
       if (this.pool) {
@@ -748,6 +833,9 @@ class Store {
       return sliced
    }
 
+   /**
+    * Tracks message IDs to filter out duplicates.
+    */
    public recordMessageId(sock: any, msg: { [key: string]: any }): boolean {
       if (msg.fromMe) return true
 
@@ -774,6 +862,9 @@ class Store {
       return true
    }
 
+   /**
+    * Cleans up expired message data and deletes historical stories older than 24 hours.
+    */
    private cleanupExpiredMessages(): void {
       if (this.fallbackStore) {
          Object.values(this.fallbackStore).forEach((msgArray) => {

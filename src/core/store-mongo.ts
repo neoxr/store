@@ -17,6 +17,7 @@ const loadMongo = async () => {
 
 class Store {
    public client: Client | null
+   public socket: any | null
    public storeDir: string
    public max: number
    public uri: string | undefined
@@ -51,6 +52,7 @@ class Store {
 
    constructor(dir: string = 'stores', max: number = 250, uri?: string) {
       this.client = null
+      this.socket = null
       this.storeDir = path.join(process.cwd(), '.cache', dir)
       this.max = max
       this.uri = uri || process.env.USE_STORE
@@ -70,10 +72,21 @@ class Store {
       setInterval(() => this.cleanupExpiredMessages(), 120000)
    }
 
+   /**
+    * Converts Buffers and Uint8Arrays to base64 objects early.
+    * This prevents JSON.stringify from calling the native toJSON() method on Buffers,
+    * which expands binary data into massive numeric arrays in memory, causing RSS spikes.
+    */
    private toPOJO(obj: any, seen = new WeakSet()): any {
       if (obj === null || typeof obj !== 'object') return obj
       if (seen.has(obj)) return null
-      if (Buffer.isBuffer(obj) || obj instanceof Uint8Array) return obj
+
+      if (Buffer.isBuffer(obj)) {
+         return { type: 'Buffer', data: obj.toString('base64') }
+      }
+      if (obj instanceof Uint8Array) {
+         return { type: 'Buffer', data: Buffer.from(obj).toString('base64') }
+      }
 
       seen.add(obj)
 
@@ -82,7 +95,9 @@ class Store {
       }
 
       const res: any = {}
-      for (const key of Object.keys(obj)) {
+      const keys = Object.keys(obj)
+      for (let i = 0; i < keys.length; i++) {
+         const key = keys[i]
          const val = obj[key]
          if (typeof val !== 'function') {
             res[key] = this.toPOJO(val, seen)
@@ -91,6 +106,9 @@ class Store {
       return res
    }
 
+   /**
+    * Initializes the MongoDB client and creates indexes for the collections.
+    */
    private async initDB(): Promise<void> {
       const MongoClient = await loadMongo()
       if (!MongoClient || !this.uri) return
@@ -126,6 +144,9 @@ class Store {
       }
    }
 
+   /**
+    * Preloads dynamic chats from MongoDB collection into the active memory cache.
+    */
    private async preloadChats(): Promise<void> {
       if (!this.chatsCollection) return
       try {
@@ -140,6 +161,9 @@ class Store {
       } catch (e) { }
    }
 
+   /**
+    * Preloads dynamic contacts from MongoDB collection into the active memory cache.
+    */
    private async preloadContacts(): Promise<void> {
       if (!this.contactsCollection) return
       try {
@@ -154,6 +178,9 @@ class Store {
       } catch (e) { }
    }
 
+   /**
+    * Creates a proxy handler to manage cache updates and auto-syncing chat records to MongoDB.
+    */
    private createChatsProxy(): Record<string, any> {
       const self = this
       return new Proxy(Object.create(null), {
@@ -183,6 +210,9 @@ class Store {
       }) as Record<string, any>
    }
 
+   /**
+    * Creates a proxy handler to manage cache updates and auto-syncing contact records to MongoDB.
+    */
    private createContactsProxy(): Record<string, Contact> {
       const self = this
       return new Proxy(Object.create(null), {
@@ -220,8 +250,12 @@ class Store {
       return this.contactsProxyInstance
    }
 
-   public bind<T extends Client>(client: T): T {
+   /**
+    * Binds active client and socket connections to the store module.
+    */
+   public bind<T extends Client>(client: T, socket: any): T {
       this.client = client
+      this.socket = socket
 
       client.loadMessage = this.loadMessage.bind(this)
       client.loadMessages = this.loadMessages.bind(this)
@@ -252,6 +286,9 @@ class Store {
       return client
    }
 
+   /**
+    * Internal helper to load raw messages history of a JID directly from MongoDB.
+    */
    private async getMongoData(jid: string): Promise<WAMessage[]> {
       if (this.cache.has(jid)) return this.cache.get(jid)!
       if (!this.messagesCollection) return []
@@ -265,6 +302,9 @@ class Store {
       } catch { return [] }
    }
 
+   /**
+    * Adds a new message record and triggers automatic truncation in the active writes queue.
+    */
    public async addMessage(jid: string, msg: WAMessage): Promise<void> {
       const msgId = msg.key?.id || (msg as any).id
       if (!msgId) return
@@ -312,6 +352,9 @@ class Store {
       }
    }
 
+   /**
+    * Updates a message structure by merging incoming status receipts.
+    */
    public async updateMessageWithReceipt(msg: any, receipt: any): Promise<void> {
       if (!msg) return
       msg.userReceipt = msg.userReceipt || []
@@ -328,6 +371,9 @@ class Store {
       }
    }
 
+   /**
+    * Updates a message structure by merging dynamic user reactions.
+    */
    public async updateMessageWithReaction(msg: any, reaction: any): Promise<void> {
       if (!msg) return
       const authorID = getKeyAuthor(reaction.key)
@@ -343,6 +389,9 @@ class Store {
       }
    }
 
+   /**
+    * Loads a single message based on JID and message ID.
+    */
    public async loadMessage(jid: string, id: string): Promise<WAMessage | null> {
       if (this.messagesCollection) {
          try {
@@ -357,6 +406,9 @@ class Store {
       return list.find(v => v.key?.id === id || (v as any).id === id) || null
    }
 
+   /**
+    * Loads list of messages associated with a JID up to a specific limit.
+    */
    public async loadMessages(jid: string, count: number = 25): Promise<WAMessage[] | null> {
       if (this.messagesCollection) {
          try {
@@ -377,20 +429,26 @@ class Store {
       return [...list].reverse().slice(0, count)
    }
 
+   /**
+    * Handles partial or full updates on active chat structures.
+    */
    public chatUpdate(updates: any[]): void {
       for (const update of updates) {
          if (update.id) this.chats[update.id] = Object.assign(this.chats[update.id] || { id: update.id }, update)
       }
    }
 
+   /**
+    * Upserts contact arrays and resolves JID targets with the socket instance mapping.
+    */
    public contactsUpsert(newContacts: Contact[]): Set<string> {
       const oldContacts = new Set(Object.keys(this.contacts))
       for (const contact of newContacts) {
          const id = noSuffix(contact.id)
          let jid = id
-         if (this.client && jid?.endsWith('lid')) {
+         if (this.socket && jid?.endsWith('lid')) {
             // @ts-ignore
-            jid = this.client?.getJidFromJSON(jid)?.jid ?? id
+            jid = this.socket?.decodeJid(this.socket?.signalRepository.lidMapping.getPNForLID(jid)) ?? id
          }
          oldContacts.delete(jid)
          this.contacts[jid] = Object.assign(this.contacts[jid] || { jid }, contact)
@@ -398,24 +456,33 @@ class Store {
       return oldContacts
    }
 
+   /**
+    * Processes structural updates on dynamic contacts and maintains LID-to-PN associations.
+    */
    public contactUpdate(updates: any[]): void {
       for (const update of updates) {
          if (update.id) {
             const id = noSuffix(update.id)
             let jid = id
-            if (this.client && jid?.endsWith('lid')) {
+            if (this.socket && jid?.endsWith('lid')) {
                // @ts-ignore
-               jid = this.client?.getJidFromJSON(jid)?.jid ?? id
+               jid = this.socket?.decodeJid(this.socket?.signalRepository.lidMapping.getPNForLID(jid)) ?? id
             }
             this.contacts[jid] = Object.assign(this.contacts[jid] || { jid, id: jid }, update)
          }
       }
    }
 
+   /**
+    * Fetches a contact structure using exact JID, ID, or phoneNumber identifiers.
+    */
    public getContact(id: string): Contact | null {
       return this.contacts[id] || Object.values(this.contacts).find((c: any) => c.id === id || c.jid === id) || null
    }
 
+   /**
+    * Resolves lists of contacts alongside contextual cleaning and counting helper methods.
+    */
    public getAllContacts(offset: number = 0) {
       const list = Object.values(this.contacts).slice(offset)
       return Object.assign(list, {
@@ -433,6 +500,9 @@ class Store {
       })
    }
 
+   /**
+    * Tracks message IDs to filter out duplicates.
+    */
    public recordMessageId(sock: any, msg: any): boolean {
       const id = msg.key?.id
       if (!id || msg.fromMe) return true
@@ -448,6 +518,9 @@ class Store {
       return true
    }
 
+   /**
+    * Cleans up expired message data and deletes historical stories older than 24 hours.
+    */
    private cleanupExpiredMessages(): void {
       const now = Date.now()
       this.messageId.forEach((map, key) => {
@@ -463,6 +536,9 @@ class Store {
       }
    }
 
+   /**
+    * Fetches all message history associated with a JID using an offset constraint.
+    */
    public async getAllMessages(jid: string, offset: number = 0) {
       let list: WAMessage[] = []
 
@@ -501,6 +577,9 @@ class Store {
       })
    }
 
+   /**
+    * Saves a single story structure in MongoDB stories collection.
+    */
    public async addStory(jid: string, story: any): Promise<void> {
       const storyId = story.key?.id || story.id
       if (!storyId) return
@@ -519,6 +598,9 @@ class Store {
       }
    }
 
+   /**
+    * Loads story data associated with a JID up to a given limit.
+    */
    public async loadStories(jid: string, count?: number): Promise<any[]> {
       if (this.storiesCollection) {
          try {
@@ -534,6 +616,9 @@ class Store {
       return [...list].reverse().slice(0, count)
    }
 
+   /**
+    * Loads a single story entry based on its identifiers.
+    */
    public async loadStory(jid: string, id: string): Promise<any | null> {
       if (this.storiesCollection) {
          try {
@@ -546,6 +631,9 @@ class Store {
       return (this.stories[jid] || []).find((v: any) => v.key?.id === id) || null
    }
 
+   /**
+    * Retrieves all stories associated with a JID using offset-based listings.
+    */
    public async getAllStories(jid: string, offset: number = 0) {
       let list: any[] = []
       if (this.storiesCollection) {
@@ -580,6 +668,9 @@ class Store {
       })
    }
 
+   /**
+    * Configures capacities and triggers re-initialization if URI changes.
+    */
    public config({ max, uri }: StoreConfig): this {
       if (max) this.max = max
       if (uri && uri !== this.uri) { this.uri = uri; this.initDB() }

@@ -95,18 +95,9 @@ class Store {
    }
 
    /**
-    * PENTING: Buffer/Uint8Array di sini langsung dikonversi ke base64 string, BUKAN
-    * di-clone sebagai Buffer.
-    *
-    * Alasannya: Buffer di Node punya method `toJSON()` bawaan yang otomatis dipanggil
-    * oleh JSON.stringify SEBELUM replacer sempat melihat valuenya. toJSON() itu mengubah
-    * buffer jadi array angka biasa (mis. thumbnail 20KB -> array ~20000 elemen, tiap elemen
-    * makan ~8-16 byte di V8 -> bisa 200-300KB+ hanya untuk representasi sementara).
-    * Kalau kita sudah kasih base64 string dari sini, JSON.stringify tidak akan pernah
-    * memicu ledakan memori itu karena string biasa tidak lewat toJSON.
-    *
-    * Ini TIDAK menghapus data apa pun (jpegThumbnail dkk tetap utuh, cuma beda representasi),
-    * jadi saat di-load lagi lewat `parse()`/reviver, hasilnya balik jadi Buffer seperti semula.
+    * Converts Buffer and Uint8Array instances directly to base64 objects.
+    * This prevents JSON.stringify from calling the native toJSON() method on Buffers, 
+    * which expands binary data into massive numeric arrays in memory, causing RSS spikes.
     */
    private toPOJO(obj: any, seen = new WeakSet()): any {
       if (obj === null || typeof obj !== 'object') return obj
@@ -137,6 +128,9 @@ class Store {
       return res
    }
 
+   /**
+    * Connects to PostgreSQL using a connection pool and initializes table structures.
+    */
    private async initDB(): Promise<void> {
       const Pool = await loadPG()
 
@@ -210,6 +204,9 @@ class Store {
       }
    }
 
+   /**
+    * Preloads dynamic chats from PostgreSQL into the active memory cache.
+    */
    private async preloadChats(): Promise<void> {
       if (!this.pool) return
       try {
@@ -222,6 +219,9 @@ class Store {
       }
    }
 
+   /**
+    * Preloads dynamic contacts from PostgreSQL into the active memory cache.
+    */
    private async preloadContacts(): Promise<void> {
       if (!this.pool) return
       try {
@@ -234,6 +234,9 @@ class Store {
       }
    }
 
+   /**
+    * Configures directories, capacities, and trigger re-initialization if connection URI changes.
+    */
    public config({ dir, max, uri }: StoreConfig): this {
       let needsReinit = false
 
@@ -257,6 +260,9 @@ class Store {
       return this
    }
 
+   /**
+    * Creates a proxy handler to manage cache updates and auto-syncing chat records to PostgreSQL.
+    */
    private createChatsProxy(): Record<string, any> {
       const self = this
       return new Proxy(Object.create(null), {
@@ -288,6 +294,9 @@ class Store {
       }) as Record<string, any>
    }
 
+   /**
+    * Creates a proxy handler to manage cache updates and auto-syncing contact records to PostgreSQL.
+    */
    private createContactsProxy(): Record<string, Contact> {
       const self = this
       return new Proxy(Object.create(null), {
@@ -327,6 +336,9 @@ class Store {
       return this.contactsProxyInstance
    }
 
+   /**
+    * Binds active client and socket connections to the store module.
+    */
    public bind<T extends Client>(client: T, socket: any): T {
       this.client = client
       this.socket = socket
@@ -359,6 +371,9 @@ class Store {
       return client
    }
 
+   /**
+    * Internal helper to load raw messages history of a JID directly from PostgreSQL pool connection.
+    */
    private async getPGData(jid: string): Promise<WAMessage[]> {
       if (this.cache.has(jid)) return this.cache.get(jid)!
       if (!this.pool) return []
@@ -378,6 +393,9 @@ class Store {
       }
    }
 
+   /**
+    * Loads a single message based on JID and message ID.
+    */
    public async loadMessage(jid: string, id: string): Promise<WAMessage | null> {
       if (this.cache.has(jid)) {
          const list = this.cache.get(jid)!
@@ -397,6 +415,9 @@ class Store {
       return list.find(v => v.key?.id === id || (v as any).id === id) || null
    }
 
+   /**
+    * Loads list of messages associated with a JID up to a specific limit.
+    */
    public async loadMessages(jid: string, count: number = 25): Promise<WAMessage[] | null> {
       if (this.cache.has(jid)) {
          const list = this.cache.get(jid)!
@@ -422,6 +443,9 @@ class Store {
       return [...list].reverse().slice(0, count)
    }
 
+   /**
+    * Saves a message and schedules background table pruning inside write queues.
+    */
    public async addMessage(jid: string, msg: WAMessage): Promise<void> {
       const msgId = msg.key?.id || (msg as any).id
       if (!msgId) return
@@ -472,6 +496,9 @@ class Store {
       }
    }
 
+   /**
+    * Fetches all message history associated with a JID using an offset constraint.
+    */
    public async getAllMessages(jid: string, offset: number = 0) {
       let list: WAMessage[] = []
 
@@ -516,6 +543,9 @@ class Store {
       })
    }
 
+   /**
+    * Handles partial or full updates on active chat structures.
+    */
    public chatUpdate(updates: any[]): void {
       for (const update of updates) {
          if (update.id) {
@@ -525,6 +555,9 @@ class Store {
       }
    }
 
+   /**
+    * Upserts contact arrays and resolves JID targets with the socket instance mapping.
+    */
    public contactsUpsert(newContacts: Contact[]): Set<string> {
       const oldContacts = new Set(Object.keys(this.contacts))
       for (const contact of newContacts) {
@@ -540,6 +573,9 @@ class Store {
       return oldContacts
    }
 
+   /**
+    * Processes structural updates on dynamic contacts and maintains LID-to-PN associations.
+    */
    public contactUpdate(updates: any[]): void {
       for (const update of updates) {
          if (update.id) {
@@ -554,6 +590,9 @@ class Store {
       }
    }
 
+   /**
+    * Fetches a contact structure using exact JID, ID, or phoneNumber identifiers.
+    */
    public getContact(id: string): Contact | null {
       if (!id) return null
       if (this.contacts[id]) return this.contacts[id]
@@ -561,6 +600,9 @@ class Store {
       return found || null
    }
 
+   /**
+    * Resolves lists of contacts alongside contextual cleaning and counting helper methods.
+    */
    public getAllContacts(offset: number = 0) {
       const list = Object.values(this.contacts)
       const sliced = (offset > 0 ? list.slice(offset) : list) as any[] & { count(): number; clear(): void }
@@ -585,6 +627,9 @@ class Store {
       return sliced
    }
 
+   /**
+    * Updates a message structure by merging incoming status receipts and updates active queues.
+    */
    public async updateMessageWithReceipt(msg: any, receipt: any): Promise<void> {
       if (!msg) return
       msg.userReceipt = msg.userReceipt || []
@@ -622,6 +667,9 @@ class Store {
       }
    }
 
+   /**
+    * Updates a message structure by merging dynamic user reactions and updates active queues.
+    */
    public async updateMessageWithReaction(msg: any, reaction: any): Promise<void> {
       if (!msg) return
       const authorID = getKeyAuthor(reaction.key)
@@ -658,6 +706,9 @@ class Store {
       }
    }
 
+   /**
+    * Loads story data associated with a JID up to a given limit.
+    */
    public async loadStories(jid: string, count?: number): Promise<any[] | null> {
       if (this.pool) {
          try {
@@ -687,6 +738,9 @@ class Store {
       return [...slice].reverse()
    }
 
+   /**
+    * Loads a single story entry based on its identifiers.
+    */
    public async loadStory(jid: string, id: string): Promise<any | null> {
       if (this.pool) {
          try {
@@ -701,6 +755,9 @@ class Store {
       return list.find((v: any) => v.key?.id === id || v.id === id) || null
    }
 
+   /**
+    * Saves a single story structure in PostgreSQL stories table.
+    */
    public async addStory(jid: string, story: any): Promise<void> {
       const storyId = story.key?.id || story.id
       if (!storyId) return
@@ -725,6 +782,9 @@ class Store {
       }
    }
 
+   /**
+    * Retrieves all stories associated with a JID using offset-based listings.
+    */
    public async getAllStories(jid: string, offset: number = 0) {
       let list: any[] = []
       if (this.pool) {
@@ -775,6 +835,9 @@ class Store {
       return sliced
    }
 
+   /**
+    * Tracks message IDs to filter out duplicates and preserves insertion order if updated.
+    */
    public recordMessageId(sock: any, msg: { [key: string]: any }): boolean {
       if (msg.fromMe) return true
 
@@ -790,7 +853,7 @@ class Store {
          this.messageId.set(instance, instanceMap)
       }
 
-      // PERBAIKAN 3.1: Hapus key terlebih dahulu untuk mereset "insertion order" Map jika ada pembaruan data
+      // Reset insertion order in Map for updated message data to avoid memory retention on stale records
       if (instanceMap.has(id)) {
          if (!msg.updated) return false
          instanceMap.delete(id)
@@ -805,6 +868,9 @@ class Store {
       return true
    }
 
+   /**
+    * Cleans up expired message data and deletes historical stories older than 24 hours.
+    */
    private cleanupExpiredMessages(): void {
       if (this.fallbackStore) {
          Object.values(this.fallbackStore).forEach((msgArray) => {

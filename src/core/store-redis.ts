@@ -17,6 +17,7 @@ const loadRedis = async () => {
 
 class Store {
    public client: Client | null
+   public socket: any | null
    public storeDir: string
    public max: number
    public uri: string | undefined
@@ -45,6 +46,7 @@ class Store {
 
    constructor(dir: string = 'stores', max: number = 250, uri?: string) {
       this.client = null
+      this.socket = null
       this.storeDir = path.join(process.cwd(), '.cache', dir)
       this.max = max
       this.uri = uri || process.env.USE_STORE
@@ -64,10 +66,21 @@ class Store {
       setInterval(() => this.cleanupExpiredMessages(), 120000)
    }
 
+   /**
+    * Converts Buffers and Uint8Arrays to base64 objects early.
+    * This prevents JSON.stringify from calling the native toJSON() method on Buffers,
+    * which expands binary data into massive numeric arrays in memory, causing RSS spikes.
+    */
    private toPOJO(obj: any, seen = new WeakSet()): any {
       if (obj === null || typeof obj !== 'object') return obj
       if (seen.has(obj)) return null
-      if (Buffer.isBuffer(obj) || obj instanceof Uint8Array) return obj
+
+      if (Buffer.isBuffer(obj)) {
+         return { type: 'Buffer', data: obj.toString('base64') }
+      }
+      if (obj instanceof Uint8Array) {
+         return { type: 'Buffer', data: Buffer.from(obj).toString('base64') }
+      }
 
       seen.add(obj)
 
@@ -76,7 +89,9 @@ class Store {
       }
 
       const res: any = {}
-      for (const key of Object.keys(obj)) {
+      const keys = Object.keys(obj)
+      for (let i = 0; i < keys.length; i++) {
+         const key = keys[i]
          const val = obj[key]
          if (typeof val !== 'function') {
             res[key] = this.toPOJO(val, seen)
@@ -85,6 +100,9 @@ class Store {
       return res
    }
 
+   /**
+    * Initializes the Redis connection client and triggers initial scans for preloading cache.
+    */
    private async initDB(): Promise<void> {
       const RedisModule = await loadRedis()
 
@@ -125,6 +143,9 @@ class Store {
       }
    }
 
+   /**
+    * Preloads dynamic chats from Redis keyspace into the active memory cache.
+    */
    private async preloadChats(): Promise<void> {
       if (!this.redis) return
       try {
@@ -145,6 +166,9 @@ class Store {
       }
    }
 
+   /**
+    * Preloads dynamic contacts from Redis keyspace into the active memory cache.
+    */
    private async preloadContacts(): Promise<void> {
       if (!this.redis) return
       try {
@@ -165,6 +189,9 @@ class Store {
       }
    }
 
+   /**
+    * Configures directory pathways, capacities, and re-initializes client if URI changes.
+    */
    public config({ dir, max, uri }: StoreConfig): this {
       let needsReinit = false
 
@@ -188,6 +215,9 @@ class Store {
       return this
    }
 
+   /**
+    * Creates a proxy handler to manage cache updates and auto-syncing chat records to Redis keyspace.
+    */
    private createChatsProxy(): Record<string, any> {
       const self = this
       return new Proxy(Object.create(null), {
@@ -213,6 +243,9 @@ class Store {
       }) as Record<string, any>
    }
 
+   /**
+    * Creates a proxy handler to manage cache updates and auto-syncing contact records to Redis keyspace.
+    */
    private createContactsProxy(): Record<string, Contact> {
       const self = this
       return new Proxy(Object.create(null), {
@@ -246,8 +279,12 @@ class Store {
       return this.contactsProxyInstance
    }
 
-   public bind<T extends Client>(client: T): T {
+   /**
+    * Binds active client and socket connections to the store module.
+    */
+   public bind<T extends Client>(client: T, socket: any): T {
       this.client = client
+      this.socket = socket
 
       client.loadMessage = this.loadMessage.bind(this)
       client.loadMessages = this.loadMessages.bind(this)
@@ -277,6 +314,9 @@ class Store {
       return client
    }
 
+   /**
+    * Updates insertion order sequence of a cached JID message array.
+    */
    private touchJid(jid: string): void {
       const data = this.cache.get(jid)
       if (data) {
@@ -285,6 +325,9 @@ class Store {
       }
    }
 
+   /**
+    * Evicts the oldest cached JID from memory when cached capacity limits are exceeded.
+    */
    private evictOldestCache(): void {
       if (this.cache.size > this.maxCachedJids) {
          for (const [key] of this.cache) {
@@ -296,6 +339,9 @@ class Store {
       }
    }
 
+   /**
+    * Internal helper to load JID message arrays from memory cache or Redis keyspace.
+    */
    private async getRedisData(jid: string): Promise<WAMessage[]> {
       if (this.cache.has(jid)) {
          this.touchJid(jid)
@@ -315,6 +361,9 @@ class Store {
       }
    }
 
+   /**
+    * Internal helper to save JID message arrays into memory cache and schedules Redis writes.
+    */
    private async setRedisData(jid: string, data: WAMessage[]): Promise<void> {
       this.cache.set(jid, data)
       this.touchJid(jid)
@@ -347,11 +396,17 @@ class Store {
       }, 1500)
    }
 
+   /**
+    * Loads a single message based on JID and message ID.
+    */
    public async loadMessage(jid: string, id: string): Promise<WAMessage | null> {
       const list = await this.getRedisData(jid)
       return list.find(v => v.key?.id === id || (v as any).id === id) || null
    }
 
+   /**
+    * Loads list of messages associated with a JID up to a specific limit.
+    */
    public async loadMessages(jid: string, count?: number): Promise<WAMessage[] | null> {
       const list = await this.getRedisData(jid)
       if (list.length === 0) return null
@@ -360,6 +415,9 @@ class Store {
       return [...slice].reverse()
    }
 
+   /**
+    * Appends a message record, prunes lists, and triggers scheduled Redis syncs.
+    */
    public async addMessage(jid: string, msg: WAMessage): Promise<void> {
       const list = await this.getRedisData(jid)
       list.push(msg)
@@ -371,6 +429,9 @@ class Store {
       await this.setRedisData(jid, list)
    }
 
+   /**
+    * Fetches all message history associated with a JID using offset-based structures.
+    */
    public getAllMessages(jid: string, offset: number = 0): Promise<WAMessage[] & { count(): Promise<number>; clear(): Promise<void> }> & { count(): Promise<number>; clear(): Promise<void> } {
       const self = this
 
@@ -483,6 +544,9 @@ class Store {
       return promiseWithMethods
    }
 
+   /**
+    * Handles partial or full updates on active chat structures.
+    */
    public chatUpdate(updates: any[]): void {
       for (const update of updates) {
          if (update.id) {
@@ -492,14 +556,17 @@ class Store {
       }
    }
 
+   /**
+    * Upserts contact arrays and resolves JID targets with the socket instance mapping.
+    */
    public contactsUpsert(newContacts: Contact[]): Set<string> {
       const oldContacts = new Set(Object.keys(this.contacts))
       for (const contact of newContacts) {
          const id = noSuffix(contact.id)
          let jid = id
-         if (this.client && jid?.endsWith('lid')) {
+         if (this.socket && jid?.endsWith('lid')) {
             // @ts-ignore
-            jid = this.client?.getJidFromJSON(jid)?.jid ?? id
+            jid = this.socket?.decodeJid(this.socket?.signalRepository.lidMapping.getPNForLID(jid)) ?? id
          }
          oldContacts.delete(jid)
          this.contacts[jid] = Object.assign(this.contacts[jid] || { jid }, contact)
@@ -507,20 +574,26 @@ class Store {
       return oldContacts
    }
 
+   /**
+    * Processes structural updates on dynamic contacts and maintains LID-to-PN associations.
+    */
    public contactUpdate(updates: any[]): void {
       for (const update of updates) {
          if (update.id) {
             const id = noSuffix(update.id)
             let jid = id
-            if (this.client && jid?.endsWith('lid')) {
+            if (this.socket && jid?.endsWith('lid')) {
                // @ts-ignore
-               jid = this.client?.getJidFromJSON(jid)?.jid ?? id
+               jid = this.socket?.decodeJid(this.socket?.signalRepository.lidMapping.getPNForLID(jid)) ?? id
             }
             this.contacts[jid] = Object.assign(this.contacts[jid] || { jid, id: jid }, update)
          }
       }
    }
 
+   /**
+    * Fetches a contact structure using exact JID, ID, or phoneNumber identifiers.
+    */
    public getContact(id: string): Contact | null {
       if (!id) return null
       if (this.contacts[id]) return this.contacts[id]
@@ -528,6 +601,9 @@ class Store {
       return found || null
    }
 
+   /**
+    * Resolves lists of contacts alongside contextual cleaning and counting helper methods.
+    */
    public getAllContacts(offset: number = 0) {
       const list = Object.values(this.contacts)
       const sliced = (offset > 0 ? list.slice(offset) : list) as any[] & { count(): number; clear(): void }
@@ -557,6 +633,9 @@ class Store {
       return sliced
    }
 
+   /**
+    * Updates a message structure by merging incoming status receipts and schedules Redis syncs.
+    */
    public async updateMessageWithReceipt(msg: any, receipt: any): Promise<void> {
       if (!msg) return
       msg.userReceipt = msg.userReceipt || []
@@ -576,6 +655,9 @@ class Store {
       }
    }
 
+   /**
+    * Updates a message structure by merging dynamic user reactions and schedules Redis syncs.
+    */
    public async updateMessageWithReaction(msg: any, reaction: any): Promise<void> {
       if (!msg) return
       const authorID = getKeyAuthor(reaction.key)
@@ -594,6 +676,9 @@ class Store {
       }
    }
 
+   /**
+    * Loads story data associated with a JID up to a given limit.
+    */
    public async loadStories(jid: string, count?: number): Promise<any[] | null> {
       if (this.redis) {
          try {
@@ -615,6 +700,9 @@ class Store {
       return [...slice].reverse()
    }
 
+   /**
+    * Loads a single story entry based on its identifiers.
+    */
    public async loadStory(jid: string, id: string): Promise<any | null> {
       if (this.redis) {
          try {
@@ -629,6 +717,9 @@ class Store {
       return list.find((v: any) => v.key?.id === id || v.id === id) || null
    }
 
+   /**
+    * Saves a single story structure with 24-hour expiration inside Redis.
+    */
    public async addStory(jid: string, story: any): Promise<void> {
       const storyId = story.key?.id || story.id
       if (!storyId) return
@@ -650,6 +741,9 @@ class Store {
       }
    }
 
+   /**
+    * Retrieves all stories associated with a JID using offset-based listings.
+    */
    public async getAllStories(jid: string, offset: number = 0) {
       let list: any[] = []
       if (this.redis) {
@@ -706,6 +800,9 @@ class Store {
       return sliced
    }
 
+   /**
+    * Tracks message IDs to filter out duplicates.
+    */
    public recordMessageId(sock: any, msg: { [key: string]: any }): boolean {
       if (msg.fromMe) return true
 
@@ -732,6 +829,9 @@ class Store {
       return true
    }
 
+   /**
+    * Cleans up expired message records from active Map instances.
+    */
    private cleanupExpiredMessages(): void {
       if (this.fallbackStore) {
          Object.values(this.fallbackStore).forEach((msgArray) => {

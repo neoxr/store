@@ -5,6 +5,7 @@ import { noSuffix, getKeyAuthor } from '../utils.js'
 
 class Store {
    public client: Client | null
+   public socket: any | null
    public storeDir: string
    public max: number
    public database: string
@@ -42,6 +43,7 @@ class Store {
 
    constructor(dir: string = 'stores', max: number = 250) {
       this.client = null
+      this.socket = null
       this.storeDir = path.join(process.cwd(), '.cache', dir)
       this.max = max
       this.database = 'json'
@@ -64,12 +66,17 @@ class Store {
       this.cleanupTimer.unref?.()
    }
 
-
+   /**
+    * Schedules a task to run after a specific delay.
+    */
    private schedule(delay: number, fn: () => void): void {
       const timer = setTimeout(fn, delay)
       timer.unref?.()
    }
 
+   /**
+    * Prunes Map elements based on updated_at timestamps to enforce maximum capacity bounds.
+    */
    private pruneMapByUpdatedAt<T extends Record<string, any>>(map: Map<string, T>, maxSize: number): void {
       if (map.size <= maxSize) return
 
@@ -83,6 +90,9 @@ class Store {
       }
    }
 
+   /**
+    * Truncates story items that have expired or exceed maximum boundaries.
+    */
    private pruneStoriesCache(now: number = Date.now()): boolean {
       let updated = false
       const twentyFourHoursAgo = now - 86400000
@@ -122,10 +132,21 @@ class Store {
       return updated
    }
 
+   /**
+    * Converts Buffers and Uint8Arrays to base64 objects early.
+    * This prevents JSON.stringify from calling the native toJSON() method on Buffers,
+    * which expands binary data into massive numeric arrays in memory, causing RSS spikes.
+    */
    private toPOJO(obj: any, seen = new WeakSet()): any {
       if (obj === null || typeof obj !== 'object') return obj
       if (seen.has(obj)) return null
-      if (Buffer.isBuffer(obj) || obj instanceof Uint8Array) return obj
+
+      if (Buffer.isBuffer(obj)) {
+         return { type: 'Buffer', data: obj.toString('base64') }
+      }
+      if (obj instanceof Uint8Array) {
+         return { type: 'Buffer', data: Buffer.from(obj).toString('base64') }
+      }
 
       seen.add(obj)
 
@@ -134,7 +155,9 @@ class Store {
       }
 
       const res: any = {}
-      for (const key of Object.keys(obj)) {
+      const keys = Object.keys(obj)
+      for (let i = 0; i < keys.length; i++) {
+         const key = keys[i]
          const val = obj[key]
          if (typeof val !== 'function') {
             res[key] = this.toPOJO(val, seen)
@@ -143,6 +166,9 @@ class Store {
       return res
    }
 
+   /**
+    * Loads chat structures from the local JSON storage file.
+    */
    private loadChats(): void {
       try {
          if (fs.existsSync(this.chatsFilePath)) {
@@ -161,6 +187,9 @@ class Store {
       }
    }
 
+   /**
+    * Loads contact structures from the local JSON storage file.
+    */
    private loadContacts(): void {
       try {
          if (fs.existsSync(this.contactsFilePath)) {
@@ -179,6 +208,9 @@ class Store {
       }
    }
 
+   /**
+    * Loads stories structure arrays from the local JSON storage file.
+    */
    private loadStoriesData(): void {
       try {
          if (fs.existsSync(this.storiesFilePath)) {
@@ -195,6 +227,9 @@ class Store {
       }
    }
 
+   /**
+    * Enqueues synchronous write pipelines using Promise sequences.
+    */
    private enqueueWrite(key: string, writeFn: () => Promise<void>): void {
       const previous = this.writeQueues.get(key) || Promise.resolve()
       const current = previous
@@ -208,6 +243,9 @@ class Store {
       this.writeQueues.set(key, current)
    }
 
+   /**
+    * Schedules and executes debounced chat records writing to JSON.
+    */
    private writeChats(): void {
       if (this.chatsPendingWrite) return
       this.chatsPendingWrite = true
@@ -229,6 +267,9 @@ class Store {
       })
    }
 
+   /**
+    * Schedules and executes debounced contact records writing to JSON.
+    */
    private writeContacts(): void {
       if (this.contactsPendingWrite) return
       this.contactsPendingWrite = true
@@ -250,6 +291,9 @@ class Store {
       })
    }
 
+   /**
+    * Schedules and executes debounced story lists writing to JSON.
+    */
    private writeStoriesData(): void {
       if (this.storiesPendingWrite) return
       this.storiesPendingWrite = true
@@ -275,6 +319,9 @@ class Store {
       })
    }
 
+   /**
+    * Configures directory pathways, capacities, and reloads file systems.
+    */
    public config({ dir, max }: StoreConfig): this {
       if (dir) {
          this.storeDir = path.join(process.cwd(), '.cache', dir)
@@ -296,6 +343,9 @@ class Store {
       return this
    }
 
+   /**
+    * Creates a proxy handler to manage cache updates and auto-syncing chat records to JSON on disk.
+    */
    private createChatsProxy(): Record<string, any> {
       const self = this
       return new Proxy(Object.create(null), {
@@ -319,6 +369,9 @@ class Store {
       }) as Record<string, any>
    }
 
+   /**
+    * Creates a proxy handler to manage cache updates and auto-syncing contact records to JSON on disk.
+    */
    private createContactsProxy(): Record<string, Contact> {
       const self = this
       return new Proxy(Object.create(null), {
@@ -350,8 +403,12 @@ class Store {
       return this.contactsProxyInstance
    }
 
-   public bind<T extends Client>(client: T): T {
+   /**
+    * Binds active client and socket connections to the store module.
+    */
+   public bind<T extends Client>(client: T, socket: any): T {
       this.client = client
+      this.socket = socket
 
       client.loadMessage = this.loadMessage.bind(this)
       client.loadMessages = this.loadMessages.bind(this)
@@ -381,11 +438,17 @@ class Store {
       return client
    }
 
+   /**
+    * Resolves a sanitized file path string based on a unique JID.
+    */
    private getFilePath(jid: string): string {
       const safeJid = jid.replace(/[^a-zA-Z0-9.-]/g, '_')
       return path.join(this.storeDir, `${safeJid}.json`)
    }
 
+   /**
+    * Updates insertion order sequence of a cached JID message array.
+    */
    private touchJid(jid: string): void {
       const data = this.cache.get(jid)
       if (data) {
@@ -394,6 +457,9 @@ class Store {
       }
    }
 
+   /**
+    * Evicts the oldest cached JID from memory when cached capacity limits are exceeded.
+    */
    private evictOldestCache(): void {
       if (this.cache.size > this.maxCachedJids) {
          for (const [key] of this.cache) {
@@ -405,6 +471,9 @@ class Store {
       }
    }
 
+   /**
+    * Reads raw message records from a single JID's JSON storage file.
+    */
    private readJidData(jid: string): WAMessage[] {
       if (this.cache.has(jid)) {
          this.touchJid(jid)
@@ -430,6 +499,9 @@ class Store {
       }
    }
 
+   /**
+    * Schedules a debounced sync operation to write a JID's message array to JSON.
+    */
    private writeJidData(jid: string, data: WAMessage[]): void {
       this.cache.set(jid, data)
       this.touchJid(jid)
@@ -459,11 +531,17 @@ class Store {
       })
    }
 
+   /**
+    * Loads a single message based on JID and message ID.
+    */
    public loadMessage(jid: string, id: string): WAMessage | null {
       const list = this.readJidData(jid)
       return list.find(v => v.key?.id === id || (v as any).id === id) || null
    }
 
+   /**
+    * Loads list of messages associated with a JID up to a specific limit.
+    */
    public loadMessages(jid: string, count: number = 25): WAMessage[] | null {
       const list = this.readJidData(jid)
       if (list.length === 0) return null
@@ -472,6 +550,9 @@ class Store {
       return [...slice].reverse()
    }
 
+   /**
+    * Saves a message and schedules a local JID JSON file sync.
+    */
    public addMessage(jid: string, msg: WAMessage): void {
       const list = this.readJidData(jid)
       list.push(msg)
@@ -483,6 +564,9 @@ class Store {
       this.writeJidData(jid, list)
    }
 
+   /**
+    * Fetches all message history associated with a JID and yields an array structure.
+    */
    public getAllMessages(jid: string, offset: number = 0): WAMessage[] & { count(): number; clear(): void } {
       const list = this.readJidData(jid)
       const sliced = (offset > 0 ? list.slice(offset) : list) as WAMessage[] & { count(): number; clear(): void }
@@ -519,6 +603,9 @@ class Store {
       return sliced
    }
 
+   /**
+    * Handles partial or full updates on active chat structures.
+    */
    public chatUpdate(updates: any[]): void {
       for (const update of updates) {
          if (update.id) {
@@ -528,14 +615,17 @@ class Store {
       }
    }
 
+   /**
+    * Upserts contact arrays and resolves JID targets with the socket instance mapping.
+    */
    public contactsUpsert(newContacts: Contact[]): Set<string> {
       const oldContacts = new Set(Object.keys(this.contacts))
       for (const contact of newContacts) {
          const id = noSuffix(contact.id)
          let jid = id
-         if (this.client && jid?.endsWith('lid')) {
+         if (this.socket && jid?.endsWith('lid')) {
             // @ts-ignore
-            jid = this.client?.getJidFromJSON(jid)?.jid ?? id
+            jid = this.socket?.decodeJid(this.socket?.signalRepository.lidMapping.getPNForLID(jid)) ?? id
          }
          oldContacts.delete(jid)
          this.contacts[jid] = Object.assign(this.contacts[jid] || { jid }, contact)
@@ -543,20 +633,26 @@ class Store {
       return oldContacts
    }
 
+   /**
+    * Processes structural updates on dynamic contacts and maintains LID-to-PN associations.
+    */
    public contactUpdate(updates: any[]): void {
       for (const update of updates) {
          if (update.id) {
             const id = noSuffix(update.id)
             let jid = id
-            if (this.client && jid?.endsWith('lid')) {
+            if (this.socket && jid?.endsWith('lid')) {
                // @ts-ignore
-               jid = this.client?.getJidFromJSON(jid)?.jid ?? id
+               jid = this.socket?.decodeJid(this.socket?.signalRepository.lidMapping.getPNForLID(jid)) ?? id
             }
             this.contacts[jid] = Object.assign(this.contacts[jid] || { jid, id: jid }, update)
          }
       }
    }
 
+   /**
+    * Fetches a contact structure using exact JID, ID, or phoneNumber identifiers.
+    */
    public getContact(id: string): Contact | null {
       if (!id) return null
       if (this.contacts[id]) return this.contacts[id]
@@ -570,6 +666,9 @@ class Store {
       return found || null
    }
 
+   /**
+    * Resolves lists of contacts alongside contextual cleaning and counting helper methods.
+    */
    public getAllContacts(offset: number = 0) {
       const list = Object.values(this.contacts)
       const sliced = (offset > 0 ? list.slice(offset) : list) as any[] & { count(): number; clear(): void }
@@ -596,6 +695,9 @@ class Store {
       return sliced
    }
 
+   /**
+    * Updates a message structure by merging incoming status receipts.
+    */
    public updateMessageWithReceipt(msg: any, receipt: any): void {
       if (!msg) return
       msg.userReceipt = msg.userReceipt || []
@@ -615,6 +717,9 @@ class Store {
       }
    }
 
+   /**
+    * Updates a message structure by merging dynamic user reactions.
+    */
    public updateMessageWithReaction(msg: any, reaction: any): void {
       if (!msg) return
       const authorID = getKeyAuthor(reaction.key)
@@ -633,6 +738,9 @@ class Store {
       }
    }
 
+   /**
+    * Loads story lists associated with a JID up to a given limit.
+    */
    public async loadStories(jid: string, count?: number): Promise<any[] | null> {
       const list = this.storiesCache.get(jid)
       if (!list || list.length === 0) return null
@@ -640,12 +748,18 @@ class Store {
       return [...slice].reverse()
    }
 
+   /**
+    * Loads a single story entry based on its identifiers.
+    */
    public async loadStory(jid: string, id: string): Promise<any | null> {
       const list = this.storiesCache.get(jid)
       if (!list || list.length === 0) return null
       return list.find((v: any) => v.key?.id === id || v.id === id) || null
    }
 
+   /**
+    * Saves a single story structure in active story caches and triggers file updates.
+    */
    public async addStory(jid: string, story: any): Promise<void> {
       const storyId = story.key?.id || story.id
       if (!storyId) return
@@ -670,6 +784,9 @@ class Store {
       this.writeStoriesData()
    }
 
+   /**
+    * Retrieves all stories associated with a JID using offset-based listing structures.
+    */
    public async getAllStories(jid: string, offset: number = 0) {
       const list = this.storiesCache.get(jid) || []
       const sliced = (offset > 0 ? list.slice(offset) : list) as any[] & { count(): Promise<number>; clear(): Promise<void> }
@@ -687,6 +804,9 @@ class Store {
       return sliced
    }
 
+   /**
+    * Tracks message IDs to filter out duplicates.
+    */
    public recordMessageId(sock: any, msg: { [key: string]: any }): boolean {
       if (msg.fromMe) return true
 
@@ -713,6 +833,9 @@ class Store {
       return true
    }
 
+   /**
+    * Cleans up expired message data and schedules dynamic background pruning.
+    */
    private cleanupExpiredMessages(): void {
       const now = Date.now()
       this.messageId.forEach((instanceMap, instance) => {
