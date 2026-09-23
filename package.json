@@ -1,23 +1,21 @@
 {
   "name": "@neoxr/store",
   "version": "0.0.6",
-  "description": "Simplicity WhatsApp Bot (Baileys)",
+  "description": "A lightweight, pluggable store for applications that need to retain messages, records, events, contacts, and application state without keeping every item in memory",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "files": [
     "lib/*"
   ],
   "scripts": {
-    "build:all": "tsc && typedoc",
-    "build:docs": "typedoc",
-    "build:tsc": "tsc",
     "build": "tsc",
-    "prepack": "tsc",
-    "prepare": "tsc"
+    "prepublishOnly": "npm run build",
+    "prepare": "tsc",
+    "test": "npx ts-node ./test.ts"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/neoxr/neoxr-bot.git#utils/message-store"
+    "url": "git+https://github.com/neoxr/store.git"
   },
   "keywords": [
     "store",
@@ -29,9 +27,9 @@
   "author": "Wildan Izzudin",
   "license": "ISC",
   "bugs": {
-    "url": "https://github.com/neoxr/neoxr-bot/issues"
+    "url": "https://github.com/neoxr/store/issues"
   },
-  "homepage": "https://github.com/neoxr/neoxr-bot#readme",
+  "homepage": "https://github.com/neoxr/store#readme",
   "peerDependencies": {
     "better-sqlite3": "~12.1.1",
     "mongodb": "~4.9.0",

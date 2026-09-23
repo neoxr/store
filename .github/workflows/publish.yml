@@ -1,0 +1,38 @@
+name: Publish with Yarn + Provenance
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install Yarn
+        run: corepack enable
+
+      - name: Install dependencies with Yarn
+        run: yarn install --frozen-lockfile
+
+      - name: Build project
+        run: yarn build
+
+      - name: Publish to npm with provenance
+        run: |
+          npm publish --access public --provenance
+          npm deprecate @neoxr/store@"< ${{ github.ref_name }}" "This version is deprecated, please upgrade to the latest version."
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
