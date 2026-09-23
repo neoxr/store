@@ -1,256 +1,208 @@
 # @neoxr/store
 
-> A lightweight data storage and state management utility for WhatsApp bots built with Baileys. It maintains a resource-optimized memory footprint for transient data while persisting message history and chat sessions to a backend of your choice.
+> A lightweight, pluggable store for applications that need to retain messages, records, events, contacts, and application state without keeping every item in memory.
 
-### ⌗ FEATURES
+[Bahasa Indonesia](README.id.md)
 
-- **Comprehensive Data Management**: Manages messages, chats, contacts, stories, presences, connection state, and message IDs.
-- **Multi-Backend Support**: Use standard JSON files by default, or opt-in to SQLite, Redis, MySQL, MongoDB, or PostgreSQL.
-- **Lazy Loading & Proxy Architecture**: Chats and messages are loaded from storage only when accessed, keeping RAM usage strictly bounded.
-- **Optional Dependencies**: Heavy database drivers (`better-sqlite3`, `redis`, `mysql2`, `pg`, `mongodb`) are dynamically imported.
-- **Anti-Corruption Safeguards**: Uses Atomic Writes (temp files) for JSON, WAL mode for SQLite, and transaction/connection pools for relational databases.
-- **Easy Integration**: Hooks directly into the Baileys client instance with a single `bind()` call.
+`@neoxr/store` attaches a small storage API to any mutable JavaScript object. It is not tied to a particular messaging SDK or framework: use it with an event emitter, a web service, a worker, or your own application object.
 
-### ⌗ INSTALLATION
+## Features
 
-Install the core package:
+- **Pluggable storage backends:** JSON files (default), SQLite, Redis, MySQL, MongoDB, and PostgreSQL.
+- **Bounded message history:** keeps only the most recent `max` records per key.
+- **Memory-aware access:** caches hot data while persisting messages and chat-like records to the selected backend.
+- **Generic integration:** `bind()` works with any writable object; no framework-specific client is required.
+- **State helpers:** manages records, contacts, group metadata, stories, binary nodes, presences, connection state, and processed message IDs.
+- **Safer persistence:** the JSON backend writes through temporary files; database backends use their native persistence mechanisms.
 
-```bash
-yarn add @neoxr/store@github:neoxr/neoxr-bot#feat/store
-```
+## Installation
 
-Depending on the storage engine you plan to use, install the corresponding optional peer dependency:
+Install the package with your preferred package manager:
 
 ```bash
-# For SQLite
-yarn add better-sqlite3
-
-# For Redis
-yarn add redis
-
-# For MySQL
-yarn add mysql2
-
-# For MongoDB
-yarn add mongodb
-
-# For PostgreSQL
-yarn add pg
+npm install @neoxr/store
+# or: yarn add @neoxr/store
+# or: pnpm add @neoxr/store
 ```
 
-### ⌗ CONFIGURATION
+The JSON backend requires no additional package. For another backend, install its driver in your application:
 
-Import the specific storage engine you want to use. You can configure the storage settings dynamically via `config()`.
+```bash
+npm install better-sqlite3 # SQLite
+npm install redis          # Redis
+npm install mysql2         # MySQL
+npm install mongodb        # MongoDB
+npm install pg             # PostgreSQL
+```
 
-```typescript
-export interface StoreConfig {
-   dir?: string
-   max?: number
-   uri?: string
+## Choose a backend
+
+The default export selects a backend from `USE_STORE` **when it is first used**. Set the variable before starting Node:
+
+```bash
+USE_STORE=sqlite node app.js
+```
+
+| `USE_STORE` value | Backend |
+| --- | --- |
+| unset (default) | JSON files |
+| `sqlite` | SQLite |
+| `redis` | Redis |
+| `mysql` | MySQL |
+| `mongo` | MongoDB |
+| `pgsql` or `postgres` | PostgreSQL |
+
+Alternatively, import a backend directly when you prefer an explicit dependency:
+
+```js
+import storeModule from '@neoxr/store/lib/core/store-json.js'
+
+const store = storeModule.default ?? storeModule
+// Other options: store-sqlite.js, store-redis.js, store-mysql.js,
+// store-mongo.js, and store-pgsql.js.
+```
+
+## Quick start
+
+Configure the store, bind it to an ordinary application object, and save or retrieve records. The example uses generic IDs and a simple text field so it can be adapted to your own event source.
+
+```js
+import storeModule from '@neoxr/store'
+
+const store = storeModule.default ?? storeModule
+
+store.config({
+  dir: 'app-store',
+  max: 300
+})
+
+const app = {}
+store.bind(app)
+
+const channelId = 'orders:42'
+const record = {
+  key: { id: 'event-001' },
+  text: 'Order created'
+}
+
+app.addMessage(channelId, record)
+
+const saved = app.loadMessage(channelId, 'event-001')
+const recent = app.loadMessages(channelId, 10)
+```
+
+Some database backends perform I/O asynchronously. Use `await` with methods that return a promise:
+
+```js
+await app.addMessage(channelId, record)
+const saved = await app.loadMessage(channelId, 'event-001')
+```
+
+### Backend configuration
+
+`config()` accepts the following options:
+
+```ts
+interface StoreConfig {
+  dir?: string
+  max?: number
+  uri?: string
 }
 ```
 
-Example using JSON:
+- `dir` is the storage directory for file-based backends. JSON stores its files under `.cache/<dir>`.
+- `max` is the maximum number of messages or nodes retained for a key.
+- `uri` is the connection URI for Redis, MySQL, MongoDB, and PostgreSQL.
 
-```javascript
-import store from '@neoxr/store/lib/store-json.js'
+For example, configure MongoDB with a URI:
+
+```js
+import storeModule from '@neoxr/store/lib/core/store-mongo.js'
+
+const store = storeModule.default ?? storeModule
 
 store.config({
-   dir: 'messages',
-   max: 300
+  max: 300,
+  uri: 'mongodb://127.0.0.1:27017/app_store'
 })
 ```
 
-Example using SQLite:
+## Bound API
 
-```javascript
-import store from '@neoxr/store/lib/store-sqlite.js'
+`store.bind(target)` adds the following capabilities to `target`. The exact return type may be synchronous or promise-based, depending on the backend.
 
-store.config({
-   dir: 'messages',
-   max: 300
+### Records and messages
+
+| Method | Description |
+| --- | --- |
+| `addMessage(key, message)` | Stores a message-like record. The record should include `key.id` (or `id`). |
+| `loadMessage(key, id)` | Returns one stored record, or `null` when absent. It can also look up by ID where supported. |
+| `loadMessages(key, count?)` | Returns the most recent records for a key. |
+| `getAllMessages(key, offset?)` | Returns all records from an offset; the returned collection provides `.count()` and `.clear()`. |
+| `updateMessageWithReceipt(message, receipt)` | Updates receipt-style metadata on a stored record. |
+| `updateMessageWithReaction(message, reaction)` | Updates reaction-style metadata on a stored record. |
+
+### Application state
+
+| Property or method | Description |
+| --- | --- |
+| `chats` | Persistent, proxy-backed record collection for chat- or session-like data. |
+| `chatUpdate(updates)` | Applies updates to `chats`. |
+| `contacts`, `contactsUpsert(items)`, `contactUpdate(updates)` | In-memory contact collection and update helpers. |
+| `getContact(id)` / `getAllContacts(offset?)` | Looks up one contact or lists contacts; the latter supports `.count()` and `.clear()`. |
+| `groupMetadata`, `loadGroupMetadata(id)`, `addGroupMetadata(id, value)` | Group metadata cache and access helpers. |
+| `groupMetadataUpsert(items)` / `deleteGroupMetadata(id)` | Bulk update or remove group metadata. |
+| `stories`, `addStory(key, story)`, `loadStory(key, id)` | Store and retrieve story-like records. |
+| `loadStories(key, count?)` / `getAllStories(key, offset?)` | List story-like records; all-results collections support `.count()` and `.clear()`. |
+| `presences`, `state`, `messageId` | Mutable presence, connection-state, and processed-ID state. |
+| `recordMessageId(source, message)` | Records an ID and returns `false` when the message was already seen. |
+
+### Binary nodes or events
+
+Use node helpers for structured event payloads that should be stored separately from messages:
+
+```js
+app.addNode({
+  tag: 'event',
+  attrs: { id: 'evt-002', from: channelId },
+  content: [{ tag: 'data', attrs: { kind: 'example' }, content: [] }]
+})
+
+const event = app.loadNode(channelId, 'evt-002')
+```
+
+`addNode(node, customKey?)` derives the key from `node.attrs.from` or `node.attrs.participant` when no key is provided. `loadNode`, `loadNodes`, and `getAllNodes` provide the equivalent retrieval operations. Binary `Buffer` and `Uint8Array` values in node payloads are sanitized before persistence.
+
+## Integration pattern
+
+Bind once during application startup, then call the attached methods from your own handlers. For an event emitter, a minimal pattern looks like this:
+
+```js
+import { EventEmitter } from 'node:events'
+import storeModule from '@neoxr/store'
+
+const store = storeModule.default ?? storeModule
+
+store.config({ dir: 'events', max: 100 })
+
+const app = new EventEmitter()
+store.bind(app)
+
+app.on('record', async ({ stream, record }) => {
+  await app.addMessage(stream, record)
 })
 ```
 
-Or if you're using a cloud database like MongoDB, use the URI:
+The store does not subscribe to external SDK events for you. Map events from your application to the bound methods that match your data model.
 
-```javascript
-import store from '@neoxr/store/lib/store-mongo.js'
+## Development
 
-store.config({
-   max: 300,
-   uri: 'mongodb://localhost:27017/mydb'
-})
+```bash
+yarn build
 ```
 
-### ⌗ USAGE EXAMPLE
+This compiles TypeScript and generates API documentation. Use `yarn build:tsc` to run only the TypeScript compilation.
 
-Integrating the store into your Baileys connection:
+## License
 
-```javascript
-import { makeWASocket } from '@whiskeysockets/baileys'
-import store from '@neoxr/store/lib/store-sqlite.js'
-
-async function connectToWA() {
-   const client = makeWASocket({
-      // Your Baileys configuration
-   })
-
-   store.bind(client)
-
-   client.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return
-
-      for (const msg of messages) {
-         const jid = msg.key.remoteJid
-         if (!jid) continue
-
-         client.addMessage(jid, msg)
-
-         const singleMsg = client.loadMessage(jid, msg.key.id)
-         const history = client.loadMessages(jid, 10)
-      }
-   })
-
-   client.ev.on('chats.update', (updates) => {
-      client.chatUpdate(updates)
-   })
-
-   client.ev.on('contacts.upsert', (newContacts) => {
-      client.contactsUpsert(newContacts)
-   })
-}
-
-connectToWA()
-```
-
-### ⌗ API REFERENCE
-
-Once the store is bound to your `client` instance, the following properties and methods become available:
-
----
-
-#### 📁 PERSISTENT GETTERS (0 RAM / Proxy-driven)
-
-#### `client.chats`
-Exposes direct access to chat sessions: `Record<string, any>`. Reads and writes directly to persistent database storage (SQLite/MySQL/Postgres/Mongo) or files (JSON) with atomic operations.
-
----
-
-#### 🧠 MEMORY-BASED PROPERTIES (RAM Cache)
-
-- `client.contacts`: `Record<string, Contact>`
-- `client.stories`: `Record<string, any[]>`
-- `client.presences`: `Record<string, { [participant: string]: PresenceData }>`
-- `client.state`: `ConnectionState`
-- `client.messageId`: `Map<string, Map<string, { at: number }>>`
-
----
-
-#### 🧩 NODE METHODS
-
-Manages raw WhatsApp XML/binary stanza nodes received from the WebSocket (e.g. `<message>`, `<call>`, `<notification>`).
-
-> **Buffer Safeguard:** Any binary `Buffer` or `Uint8Array` inside the node payload (such as encrypted message ciphertext) is automatically sanitized and replaced with `'[buffer]'` before persistence to prevent memory leaks and database serialization errors.
-
-```typescript
-// Example Node Payload Structure
-{
-  tag: 'message',
-  attrs: {
-    from: '120363403664875148@g.us',
-    type: 'text',
-    id: 'AC3691F18130145FF445F111B2AF5B8A',
-    participant: '260597593682096@lid',
-    t: '1788530802'
-  },
-  content: [
-    { tag: 'reporting', attrs: {}, content: [] },
-    { tag: 'enc', attrs: { type: 'pkmsg' }, content: '[buffer]' }
-  ]
-}
-```
-
-#### `client.addNode(node: any, customJid?: string): Promise<void> | void`
-#### `client.addNode(jid: string, node: any): Promise<void> | void`
-Saves a sanitized node to persistent storage and updates the RAM cache (`client.nodes`).
-- **Flexible Calling:** Accepts `client.addNode(node)` (JID is automatically extracted from `attrs.from` / `attrs.participant`) or `client.addNode(jid, node)`.
-- **FIFO Auto-Pruning:** Once stored nodes under a specific JID reach `max`, the oldest nodes are pruned. Data is **never** deleted by arbitrary timers.
-
-#### `client.loadNode(jid: string, id?: string): Promise<any | null> | any | null`
-Retrieves a specific node by its ID.
-- **Single Argument:** `client.loadNode(id)` looks up the node across all stored chats.
-- **Two Arguments:** `client.loadNode(jid, id)` retrieves the node scoped strictly to that JID.
-
-#### `client.loadNodes(jid?: string | number, count?: number): Promise<any[] | null> | any[] | null`
-Loads latest stored nodes in reverse chronological order.
-- Can be called as `client.loadNodes(jid, 25)` or `client.loadNodes(25)` to query globally.
-
-#### `client.getAllNodes(jid?: string, offset?: number): Promise<any[] & { count(): Promise<number>; clear(): Promise<void> }>`
-Retrieves all stored nodes starting from the specified offset.
-- `.count()`: Returns total node count minus offset.
-- `.clear()`: Deletes stored nodes for the given JID (or clears all nodes if no JID is passed).
-
-#### 💬 MESSAGE METHODS
-
-#### `client.addMessage(jid: string, msg: WAMessage): void`
-Saves a message to persistent storage. Truncates older history once it exceeds the `max` configuration limit.
-
-#### `client.loadMessage(jid: string, id: string): WAMessage | null`
-Retrieves a specific message by its ID within a given chat JID.
-
-#### `client.loadMessages(jid: string, count?: number): WAMessage[] | null`
-Loads the latest `$count` messages from a specific JID in reverse order (newest message first).
-
-#### `client.getAllMessages(jid: string, offset?: number): WAMessage[] & { count(): number; clear(): void }`
-Loads all messages starting from the given offset. Supports chainable methods:
-* `.count()`: Returns the total count of messages for this JID minus the offset.
-* `.clear()`: Clears the messages from persistent storage.
-
-#### `client.updateMessageWithReceipt(msg: any, receipt: any): void`
-Updates message receipt data (delivery/read status) in memory and automatically persists the updated message back to the database.
-
-#### `client.updateMessageWithReaction(msg: any, reaction: any): void`
-Updates reactions on a message and automatically persists the changes to the database.
-
----
-
-#### 📇 CHAT & CONTACT METHODS
-
-#### `client.chatUpdate(updates: any[]): void`
-Saves and updates chat session data directly inside the persistent database storage.
-
-#### `client.contactsUpsert(newContacts: Contact[]): Set<string>`
-Inserts or merges new contacts into the RAM cache. Returns a Set containing old contact IDs.
-
-#### `client.contactUpdate(updates: any[]): void`
-Updates existing contact records in memory.
-
-#### `client.getContact(id: string): Contact | null`
-Retrieves a specific contact, matching by key JID, phone number, or internal ID.
-
-#### `client.getAllContacts(offset?: number): Contact[] & { count(): number; clear(): void }`
-Retrieves all contacts. Supports `.count()` and `.clear()`.
-
----
-
-#### 📱 STORY METHODS
-
-#### `client.addStory(jid: string, story: any): void`
-Saves a story under the specific JID in RAM. Truncates older history once it exceeds 50 stories.
-
-#### `client.loadStory(jid: string, id: string): any | null`
-Retrieves a specific story by its ID under a given JID.
-
-#### `client.loadStories(jid: string, count?: number): any[] | null`
-Loads latest stories under a given JID.
-
-#### `client.getAllStories(jid: string, offset?: number): any[] & { count(): number; clear(): void }`
-Retrieves all stories under a given JID. Supports `.count()` and `.clear()`.
-
----
-
-#### 🛡️ TRACKING & SECURITY
-
-#### `client.recordMessageId(sock: sock, msg: any): boolean`
-Logs message IDs to prevent double-processing or replay attacks. Automatically sweeps logs older than 15 minutes. Returns `false` if the message ID was already processed.
+ISC
