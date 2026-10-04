@@ -83,6 +83,8 @@ class Store {
    public state: ConnectionState = { connection: 'close' }
    public messageId: Map<string, Map<string, { at: number }>> = new Map()
 
+   private cleanupTimer: NodeJS.Timeout
+
    private insertStmt: any = null
    private cleanupStmt: any = null
    private getOneStmt: any = null
@@ -154,7 +156,8 @@ class Store {
          this.log('warn', 'SQLite storage flag not detected in environment. Operating in RAM storage mode.')
       }
 
-      setInterval(() => this.cleanupExpiredMessages(), 120000)
+      this.cleanupTimer = setInterval(() => this.cleanupExpiredMessages(), 120000)
+      this.cleanupTimer.unref?.()
    }
 
    private log(type: 'info' | 'warn' | 'error' | 'debug', message: string, ...args: any[]): void {

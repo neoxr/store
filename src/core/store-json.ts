@@ -172,6 +172,7 @@ class Store {
 
       for (const [jid, list] of this.storiesCache.entries()) {
          if (list.length > this.max) {
+            this.storiesCache.delete(jid)
             this.storiesCache.set(jid, list.slice(-this.max))
             updated = true
          }
@@ -182,6 +183,7 @@ class Store {
          const keys = Array.from(this.storiesCache.keys()).slice(0, overflow)
          for (const key of keys) {
             this.storiesCache.delete(key)
+            delete this.stories[key]
             updated = true
          }
       }
@@ -365,11 +367,12 @@ class Store {
          if (fs.existsSync(this.storiesFilePath)) {
             const content = fs.readFileSync(this.storiesFilePath, 'utf-8')
             const parsed = parse(content) as Record<string, any[]>
-            for (const [jid, list] of Object.entries(parsed)) {
-               if (Array.isArray(list)) {
-                  this.storiesCache.set(jid, list.filter(Boolean).slice(-this.max))
-                  this.stories[jid] = this.storiesCache.get(jid)!
-               }
+            const entries = Object.entries(parsed)
+               .filter(([, list]) => Array.isArray(list))
+               .slice(-this.maxCachedStoryJids)
+            for (const [jid, list] of entries) {
+               this.storiesCache.set(jid, list.filter(Boolean).slice(-this.max))
+               this.stories[jid] = this.storiesCache.get(jid)!
             }
             this.log('debug', `Loaded stories for ${colors.green}${this.storiesCache.size}${colors.reset} JIDs from disk.`)
          }

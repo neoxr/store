@@ -87,6 +87,7 @@ class Store {
    private maxCachedJids = 10
    private writeQueues = new Map<string, Promise<any>>()
    private nodeWriteQueues = new Map<string, Promise<any>>()
+   private cleanupTimer: NodeJS.Timeout
 
    private chatsCache = new Map<string, any>()
    private chatsProxyInstance: Record<string, any>
@@ -117,7 +118,8 @@ class Store {
          this.initDB()
       }
 
-      setInterval(() => this.cleanupExpiredMessages(), 120000)
+      this.cleanupTimer = setInterval(() => this.cleanupExpiredMessages(), 120000)
+      this.cleanupTimer.unref?.()
    }
 
    private log(type: 'info' | 'warn' | 'error' | 'debug', message: string, ...args: any[]): void {
