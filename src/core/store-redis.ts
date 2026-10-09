@@ -88,6 +88,7 @@ class Store {
    private pendingJidWrites = new Set<string>()
    private writeQueues = new Map<string, Promise<any>>()
    private nodeWriteQueues = new Map<string, Promise<any>>()
+   private cleanupTimer: NodeJS.Timeout
 
    private chatsCache = new Map<string, any>()
    private chatsProxyInstance: Record<string, any>
@@ -115,7 +116,8 @@ class Store {
          this.initDB()
       }
 
-      setInterval(() => this.cleanupExpiredMessages(), 120000)
+      this.cleanupTimer = setInterval(() => this.cleanupExpiredMessages(), 120000)
+      this.cleanupTimer.unref?.()
    }
 
    private log(type: 'info' | 'warn' | 'error' | 'debug', message: string, ...args: any[]): void {
@@ -589,7 +591,7 @@ class Store {
       if (this.pendingJidWrites.has(jid)) return
       this.pendingJidWrites.add(jid)
 
-      setTimeout(() => {
+      const timer = setTimeout(() => {
          this.pendingJidWrites.delete(jid)
          const currentData = this.cache.get(jid)
          if (!currentData || !this.redis) return
@@ -612,6 +614,7 @@ class Store {
             })
          this.writeQueues.set(jid, current)
       }, 1500)
+      timer.unref?.()
    }
 
    public async loadMessage(jidOrId: string, id?: string): Promise<WAMessage | null> {
