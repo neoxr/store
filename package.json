@@ -1,6 +1,6 @@
 {
   "name": "@neoxr/store",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "A lightweight, pluggable store for applications that need to retain messages, records, events, contacts, and application state without keeping every item in memory",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
