@@ -1,6 +1,6 @@
 import { type Contact, type ConnectionState, type PresenceData, Client, WAMessage, StoreConfig, type CleanOptions, type UpdatePatch } from '../interface.js'
 import path from 'node:path'
-import { noSuffix, getKeyAuthor } from '../utils.js'
+import { noSuffix, getKeyAuthor, isFromSender, senderPatterns } from '../utils.js'
 
 let PGConstructor: any = null
 const loadPG = async () => {
@@ -559,6 +559,7 @@ class Store {
 
       safeAssign(client, 'loadMessage', this.loadMessage.bind(this))
       safeAssign(client, 'loadMessages', this.loadMessages.bind(this))
+      safeAssign(client, 'loadSenderMessages', this.loadSenderMessages.bind(this))
       safeAssign(client, 'addMessage', this.addMessage.bind(this))
       safeAssign(client, 'getAllMessages', this.getAllMessages.bind(this))
       safeAssign(client, 'updateMessage', this.updateMessage.bind(this))
@@ -706,6 +707,73 @@ class Store {
       const list = this.fallbackStore?.[jid] || []
       if (list.length === 0) return null
       return [...list].reverse().slice(0, count)
+   }
+
+   public async loadSenderMessages(sender: string, limit: number = 25): Promise<WAMessage[] | null> {
+      if (!sender) return null
+
+      const targetLimit = limit && limit > 0 ? limit : 25
+      const results: WAMessage[] = []
+      const seen = new Set<string>()
+
+      const collect = (list: WAMessage[]) => {
+         for (let i = list.length - 1; i >= 0; i--) {
+            const msg = list[i]
+            if (!isFromSender(msg, sender)) continue
+
+            const id = msg?.key?.id || (msg as any)?.id
+            if (id) {
+               if (seen.has(id)) continue
+               seen.add(id)
+            }
+
+            results.push(msg)
+         }
+      }
+
+      for (const list of this.cache.values()) collect(list)
+
+      if (this.pool) {
+         try {
+            const [exact, suffixed = exact] = senderPatterns(sender)
+            const { rows }: any = await this.pool.query(
+               `SELECT data FROM messages
+                WHERE ((data::jsonb->>'sender') = $1 OR (data::jsonb->>'sender') LIKE $2)
+                   OR ((data::jsonb->'key'->>'senderPn') = $1 OR (data::jsonb->'key'->>'senderPn') LIKE $2)
+                   OR ((data::jsonb->'key'->>'participantPn') = $1 OR (data::jsonb->'key'->>'participantPn') LIKE $2)
+                   OR ((data::jsonb->'key'->>'participant') = $1 OR (data::jsonb->'key'->>'participant') LIKE $2)
+                   OR (
+                      COALESCE(data::jsonb->'key'->>'fromMe', 'false') <> 'true'
+                      AND ((data::jsonb->'key'->>'remoteJid') = $1 OR (data::jsonb->'key'->>'remoteJid') LIKE $2)
+                   )
+                ORDER BY created_at DESC
+                LIMIT $3`,
+               [exact, suffixed, targetLimit]
+            )
+            collect(rows.map((row: any) => parse(row.data) as WAMessage))
+         } catch (error: any) {
+            this.log('warn', `Failed to query messages by sender ${sender}, falling back to full scan:`, error?.message || error)
+            try {
+               const { rows }: any = await this.pool.query('SELECT data FROM messages ORDER BY created_at DESC')
+               collect(rows.map((row: any) => parse(row.data) as WAMessage))
+            } catch (e: any) {
+               this.log('error', `Failed to scan messages by sender ${sender}:`, e?.message || e)
+            }
+         }
+      }
+
+      if (this.fallbackStore) {
+         for (const list of Object.values(this.fallbackStore)) {
+            collect(list)
+         }
+      }
+
+      if (results.length === 0) return null
+
+      results.sort((a, b) => this.toSeconds(b?.messageTimestamp) - this.toSeconds(a?.messageTimestamp))
+
+      this.log('debug', `[loadSenderMessages] Loaded ${colors.green}${Math.min(results.length, targetLimit)}${colors.reset} messages from ${colors.yellow}${sender}${colors.reset}`)
+      return results.slice(0, targetLimit)
    }
 
    public async addMessage(arg1: any, arg2?: any): Promise<void> {

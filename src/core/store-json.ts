@@ -1,7 +1,7 @@
 import { type Contact, type ConnectionState, type PresenceData, Client, WAMessage, StoreConfig, type CleanOptions, type UpdatePatch } from '../interface.js'
 import fs from 'node:fs'
 import path from 'node:path'
-import { noSuffix, getKeyAuthor } from '../utils.js'
+import { noSuffix, getKeyAuthor, isFromSender } from '../utils.js'
 
 const colors = {
    reset: '\x1b[0m',
@@ -653,6 +653,7 @@ class Store {
 
       safeAssign(client, 'loadMessage', this.loadMessage.bind(this))
       safeAssign(client, 'loadMessages', this.loadMessages.bind(this))
+      safeAssign(client, 'loadSenderMessages', this.loadSenderMessages.bind(this))
       safeAssign(client, 'addMessage', this.addMessage.bind(this))
       safeAssign(client, 'getAllMessages', this.getAllMessages.bind(this))
       safeAssign(client, 'updateMessage', this.updateMessage.bind(this))
@@ -809,6 +810,65 @@ class Store {
       this.log('debug', `[loadMessages] Loaded ${colors.green}${Math.min(list.length, count)}${colors.reset} messages for ${colors.yellow}${jid}${colors.reset}`)
       const slice = list.slice(-count)
       return [...slice].reverse()
+   }
+
+   public loadSenderMessages(sender: string, limit: number = 25): WAMessage[] | null {
+      if (!sender) return null
+
+      const targetLimit = limit && limit > 0 ? limit : 25
+      const reserved = new Set(['chats', 'contacts', 'group_metadata', 'stories', 'nodes'])
+      const handled = new Set<string>()
+      const results: WAMessage[] = []
+      const seen = new Set<string>()
+
+      const collect = (jid: string, list: WAMessage[]) => {
+         for (let i = list.length - 1; i >= 0; i--) {
+            const msg = list[i]
+            if (!isFromSender(msg, sender)) continue
+
+            const id = msg?.key?.id || (msg as any)?.id
+            const dedupeKey = id ? `${jid}:${id}` : ''
+            if (dedupeKey && seen.has(dedupeKey)) continue
+            if (dedupeKey) seen.add(dedupeKey)
+
+            results.push(msg)
+         }
+      }
+
+      for (const [jid, list] of this.cache.entries()) {
+         handled.add(this.getFilePath(jid))
+         collect(jid, list)
+      }
+
+      let files: string[] = []
+      try {
+         files = fs.readdirSync(this.storeDir)
+      } catch { }
+
+      for (const file of files) {
+         if (!file.endsWith('.json')) continue
+         if (reserved.has(file.slice(0, -5))) continue
+
+         const filePath = path.join(this.storeDir, file)
+         if (handled.has(filePath)) continue
+
+         try {
+            const list = parse(fs.readFileSync(filePath, 'utf-8'))
+            if (!Array.isArray(list)) continue
+            collect(file, list.filter(Boolean).slice(-this.max))
+         } catch (error: any) {
+            if (error.code !== 'ENOENT') {
+               this.log('error', `Failed to read message file ${file}:`, error?.message || error)
+            }
+         }
+      }
+
+      if (results.length === 0) return null
+
+      results.sort((a, b) => this.toSeconds(b?.messageTimestamp) - this.toSeconds(a?.messageTimestamp))
+
+      this.log('debug', `[loadSenderMessages] Loaded ${colors.green}${Math.min(results.length, targetLimit)}${colors.reset} messages from ${colors.yellow}${sender}${colors.reset}`)
+      return results.slice(0, targetLimit)
    }
 
    public addMessage(arg1: any, arg2?: any): void {

@@ -1,6 +1,6 @@
 import { type Contact, type ConnectionState, type PresenceData, Client, WAMessage, StoreConfig, type CleanOptions, type UpdatePatch } from '../interface.js'
 import path from 'node:path'
-import { noSuffix, getKeyAuthor } from '../utils.js'
+import { noSuffix, getKeyAuthor, isFromSender } from '../utils.js'
 
 let RedisConstructor: any = null
 const loadRedis = async () => {
@@ -506,6 +506,7 @@ class Store {
 
       safeAssign(client, 'loadMessage', this.loadMessage.bind(this))
       safeAssign(client, 'loadMessages', this.loadMessages.bind(this))
+      safeAssign(client, 'loadSenderMessages', this.loadSenderMessages.bind(this))
       safeAssign(client, 'addMessage', this.addMessage.bind(this))
       safeAssign(client, 'getAllMessages', this.getAllMessages.bind(this))
       safeAssign(client, 'updateMessage', this.updateMessage.bind(this))
@@ -654,6 +655,57 @@ class Store {
       this.log('debug', `[loadMessages] Loaded ${colors.green}${Math.min(list.length, targetCount)}${colors.reset} messages for ${colors.yellow}${jid}${colors.reset}`)
       const slice = list.slice(-targetCount)
       return [...slice].reverse()
+   }
+
+   public async loadSenderMessages(sender: string, limit: number = 25): Promise<WAMessage[] | null> {
+      if (!sender) return null
+
+      const targetLimit = limit && limit > 0 ? limit : 25
+      const results: WAMessage[] = []
+      const seen = new Set<string>()
+
+      const collect = (jid: string, list: WAMessage[]) => {
+         for (let i = list.length - 1; i >= 0; i--) {
+            const msg = list[i]
+            if (!isFromSender(msg, sender)) continue
+
+            const id = msg?.key?.id || (msg as any)?.id
+            const dedupeKey = id ? `${jid}:${id}` : ''
+            if (dedupeKey && seen.has(dedupeKey)) continue
+            if (dedupeKey) seen.add(dedupeKey)
+
+            results.push(msg)
+         }
+      }
+
+      if (this.redis) {
+         const jids = new Set<string>(this.cache.keys())
+
+         try {
+            for (const key of await this.scanKeys('msg_store:*')) {
+               jids.add(key.slice('msg_store:'.length))
+            }
+         } catch (error: any) {
+            this.log('warn', `Failed to scan message keys for sender ${sender}:`, error?.message || error)
+         }
+
+         for (const jid of jids) {
+            collect(jid, await this.getRedisData(jid))
+         }
+      }
+
+      if (this.fallbackStore) {
+         for (const [jid, list] of Object.entries(this.fallbackStore)) {
+            collect(jid, list)
+         }
+      }
+
+      if (results.length === 0) return null
+
+      results.sort((a, b) => this.toSeconds(b?.messageTimestamp) - this.toSeconds(a?.messageTimestamp))
+
+      this.log('debug', `[loadSenderMessages] Loaded ${colors.green}${Math.min(results.length, targetLimit)}${colors.reset} messages from ${colors.yellow}${sender}${colors.reset}`)
+      return results.slice(0, targetLimit)
    }
 
    public async addMessage(arg1: any, arg2?: any): Promise<void> {

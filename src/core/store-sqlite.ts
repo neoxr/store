@@ -1,7 +1,7 @@
 import { type Contact, type ConnectionState, type PresenceData, Client, WAMessage, StoreConfig, type CleanOptions, type UpdatePatch } from '../interface.js'
 import path from 'node:path'
 import fs from 'node:fs'
-import { noSuffix, getKeyAuthor } from '../utils.js'
+import { noSuffix, getKeyAuthor, isFromSender, senderPatterns } from '../utils.js'
 
 let DatabaseConstructor: any = null
 const loadSqlite = async () => {
@@ -90,6 +90,7 @@ class Store {
    private getOneStmt: any = null
    private getOneByIdStmt: any = null
    private getLimitStmt: any = null
+   private getSenderStmt: any = null
    private getAllDescStmt: any = null
    private getAllWithOffsetStmt: any = null
    private countStmt: any = null
@@ -382,6 +383,19 @@ class Store {
          this.getOneStmt = this.db.prepare('SELECT data FROM messages WHERE jid = ? AND id = ?')
          this.getOneByIdStmt = this.db.prepare('SELECT data FROM messages WHERE id = ? LIMIT 1')
          this.getLimitStmt = this.db.prepare('SELECT data FROM messages WHERE jid = ? ORDER BY created_at DESC LIMIT ?')
+         this.getSenderStmt = this.db.prepare(`
+            SELECT data FROM messages
+            WHERE (json_extract(data, '$.sender') = ? OR json_extract(data, '$.sender') LIKE ?)
+               OR (json_extract(data, '$.key.senderPn') = ? OR json_extract(data, '$.key.senderPn') LIKE ?)
+               OR (json_extract(data, '$.key.participantPn') = ? OR json_extract(data, '$.key.participantPn') LIKE ?)
+               OR (json_extract(data, '$.key.participant') = ? OR json_extract(data, '$.key.participant') LIKE ?)
+               OR (
+                  COALESCE(json_extract(data, '$.key.fromMe'), 0) = 0
+                  AND (json_extract(data, '$.key.remoteJid') = ? OR json_extract(data, '$.key.remoteJid') LIKE ?)
+               )
+            ORDER BY created_at DESC
+            LIMIT ?
+         `)
          this.getAllDescStmt = this.db.prepare('SELECT data FROM messages WHERE jid = ? ORDER BY created_at DESC')
          this.getAllWithOffsetStmt = this.db.prepare('SELECT data FROM messages WHERE jid = ? ORDER BY created_at ASC LIMIT -1 OFFSET ?')
          this.countStmt = this.db.prepare('SELECT COUNT(*) as count FROM messages WHERE jid = ?')
@@ -642,6 +656,7 @@ class Store {
 
       safeAssign(client, 'loadMessage', this.loadMessage.bind(this))
       safeAssign(client, 'loadMessages', this.loadMessages.bind(this))
+      safeAssign(client, 'loadSenderMessages', this.loadSenderMessages.bind(this))
       safeAssign(client, 'addMessage', this.addMessage.bind(this))
       safeAssign(client, 'getAllMessages', this.getAllMessages.bind(this))
       safeAssign(client, 'updateMessage', this.updateMessage.bind(this))
@@ -757,6 +772,72 @@ class Store {
       }
 
       return null
+   }
+
+   public loadSenderMessages(sender: string, limit: number = 25): WAMessage[] | null {
+      if (!sender) return null
+
+      const targetLimit = limit && limit > 0 ? limit : 25
+      const results: WAMessage[] = []
+      const seen = new Set<string>()
+
+      const collect = (list: WAMessage[]) => {
+         for (let i = list.length - 1; i >= 0; i--) {
+            const msg = list[i]
+            if (!isFromSender(msg, sender)) continue
+
+            const id = msg?.key?.id || (msg as any)?.id
+            if (id) {
+               if (seen.has(id)) continue
+               seen.add(id)
+            }
+
+            results.push(msg)
+         }
+      }
+
+      if (this.db) {
+         try {
+            let rows: { data: string }[] = []
+
+            if (this.getSenderStmt) {
+               const [exact, suffixed = exact] = senderPatterns(sender)
+               rows = this.getSenderStmt.all(
+                  exact, suffixed,
+                  exact, suffixed,
+                  exact, suffixed,
+                  exact, suffixed,
+                  exact, suffixed,
+                  targetLimit
+               ) as { data: string }[]
+            } else {
+               rows = this.db.prepare('SELECT data FROM messages ORDER BY created_at DESC').all() as { data: string }[]
+            }
+
+            collect(rows.map(row => parse(row.data) as WAMessage))
+         } catch (error: any) {
+            this.log('warn', `Failed to query messages by sender ${sender}, falling back to full scan:`, error?.message || error)
+            try {
+               const rows = this.db.prepare('SELECT data FROM messages ORDER BY created_at DESC').all() as { data: string }[]
+               collect(rows.map(row => parse(row.data) as WAMessage))
+            } catch (e: any) {
+               this.log('error', `Failed to scan messages by sender ${sender}:`, e?.message || e)
+            }
+         }
+      }
+
+      if (this.fallbackStore) {
+         for (const list of Object.values(this.fallbackStore)) {
+            collect(list)
+         }
+      }
+
+      if (results.length === 0) return null
+
+      results.sort((a, b) => this.toSeconds(b?.messageTimestamp) - this.toSeconds(a?.messageTimestamp))
+
+      this.log('debug', `[loadSenderMessages] Loaded ${colors.green}${Math.min(results.length, targetLimit)}${colors.reset} messages from ${colors.yellow}${sender}${colors.reset}`)
+      return results.slice(0, targetLimit)
    }
 
    public addMessage(arg1: any, arg2?: any): void {

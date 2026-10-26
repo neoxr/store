@@ -1,6 +1,6 @@
 import { type Contact, type ConnectionState, type PresenceData, Client, WAMessage, StoreConfig, type CleanOptions, type UpdatePatch } from '../interface.js'
 import path from 'node:path'
-import { noSuffix, getKeyAuthor } from '../utils.js'
+import { noSuffix, getKeyAuthor, isFromSender } from '../utils.js'
 
 let MongoConstructor: any = null
 const loadMongo = async () => {
@@ -476,6 +476,7 @@ class Store {
 
       safeAssign(client, 'loadMessage', this.loadMessage.bind(this))
       safeAssign(client, 'loadMessages', this.loadMessages.bind(this))
+      safeAssign(client, 'loadSenderMessages', this.loadSenderMessages.bind(this))
       safeAssign(client, 'addMessage', this.addMessage.bind(this))
       safeAssign(client, 'getAllMessages', this.getAllMessages.bind(this))
       safeAssign(client, 'updateMessage', this.updateMessage.bind(this))
@@ -849,6 +850,78 @@ class Store {
       const list = this.fallbackStore?.[jid] || []
       if (list.length === 0) return null
       return [...list].reverse().slice(0, count)
+   }
+
+   public async loadSenderMessages(sender: string, limit: number = 25): Promise<WAMessage[] | null> {
+      if (!sender) return null
+
+      const targetLimit = limit && limit > 0 ? limit : 25
+      const results: WAMessage[] = []
+      const seen = new Set<string>()
+
+      const collect = (list: WAMessage[]) => {
+         for (let i = list.length - 1; i >= 0; i--) {
+            const msg = list[i]
+            if (!isFromSender(msg, sender)) continue
+
+            const id = msg?.key?.id || (msg as any)?.id
+            if (id) {
+               if (seen.has(id)) continue
+               seen.add(id)
+            }
+
+            results.push(msg)
+         }
+      }
+
+      for (const list of this.cache.values()) collect(list)
+
+      if (this.messagesCollection) {
+         try {
+            const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            const normalized = noSuffix(sender)
+            const at = normalized.lastIndexOf('@')
+            const matcher = at === -1
+               ? new RegExp(`^${escapeRegex(normalized)}(:.*)?$`)
+               : new RegExp(`^${escapeRegex(normalized.slice(0, at))}(:.*)?@${escapeRegex(normalized.slice(at + 1))}$`)
+
+            const conditions: any[] = [
+               { 'data.sender': matcher },
+               { 'data.key.senderPn': matcher },
+               { 'data.key.participantPn': matcher },
+               { 'data.key.participant': matcher },
+               { 'data.key.remoteJid': matcher, 'data.key.fromMe': { $ne: true } }
+            ]
+
+            const docs = await this.messagesCollection.find({ $or: conditions })
+               .sort({ created_at: -1 })
+               .limit(targetLimit)
+               .toArray()
+
+            collect(docs.map((doc: any) => doc.data))
+         } catch (error: any) {
+            this.log('warn', `Failed to query messages by sender ${sender}, falling back to full scan:`, error?.message || error)
+            try {
+               const docs = await this.messagesCollection.find({}).sort({ created_at: -1 }).toArray()
+               collect(docs.map((doc: any) => doc.data))
+            } catch (e: any) {
+               this.log('error', `Failed to scan messages by sender ${sender}:`, e?.message || e)
+            }
+         }
+      }
+
+      if (this.fallbackStore) {
+         for (const list of Object.values(this.fallbackStore)) {
+            collect(list)
+         }
+      }
+
+      if (results.length === 0) return null
+
+      results.sort((a, b) => this.toSeconds(b?.messageTimestamp) - this.toSeconds(a?.messageTimestamp))
+
+      this.log('debug', `[loadSenderMessages] Loaded ${colors.green}${Math.min(results.length, targetLimit)}${colors.reset} messages from ${colors.yellow}${sender}${colors.reset}`)
+      return results.slice(0, targetLimit)
    }
 
    public async addNode(arg1: any, arg2?: any): Promise<void> {

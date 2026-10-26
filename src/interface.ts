@@ -67,6 +67,7 @@ export type ConnectionState = {
 export interface Client {
    loadMessage?: (jid: string, id: string) => WAMessage | Promise<WAMessage | null> | null
    loadMessages?: (jid: string, count?: number) => WAMessage[] | Promise<WAMessage[] | null> | null
+   loadSenderMessages?: (sender: string, limit?: number) => Promise<any> | any
    addMessage?: (jid: string, msg: WAMessage) => void | Promise<void>
    getAllMessages?: (jid: string, offset?: number) => any
    updateMessage?: (jid: string, id: string, update: UpdatePatch) => WAMessage | Promise<WAMessage | null> | null
