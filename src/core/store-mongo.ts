@@ -1,4 +1,4 @@
-import { type Contact, type ConnectionState, type PresenceData, Client, WAMessage, StoreConfig } from '../interface.js'
+import { type Contact, type ConnectionState, type PresenceData, Client, WAMessage, StoreConfig, type CleanOptions, type UpdatePatch } from '../interface.js'
 import path from 'node:path'
 import { noSuffix, getKeyAuthor } from '../utils.js'
 
@@ -478,6 +478,8 @@ class Store {
       safeAssign(client, 'loadMessages', this.loadMessages.bind(this))
       safeAssign(client, 'addMessage', this.addMessage.bind(this))
       safeAssign(client, 'getAllMessages', this.getAllMessages.bind(this))
+      safeAssign(client, 'updateMessage', this.updateMessage.bind(this))
+      safeAssign(client, 'cleanMessages', this.cleanMessages.bind(this))
 
       safeAssign(client, 'chatUpdate', this.chatUpdate.bind(this))
       safeAssign(client, 'contactsUpsert', this.contactsUpsert.bind(this))
@@ -503,6 +505,8 @@ class Store {
       safeAssign(client, 'loadNode', this.loadNode.bind(this))
       safeAssign(client, 'loadNodes', this.loadNodes.bind(this))
       safeAssign(client, 'getAllNodes', this.getAllNodes.bind(this))
+      safeAssign(client, 'updateNode', this.updateNode.bind(this))
+      safeAssign(client, 'cleanNodes', this.cleanNodes.bind(this))
 
       safeAssign(client, 'contacts', this.contacts)
       safeAssign(client, 'stories', this.stories)
@@ -1046,6 +1050,293 @@ class Store {
       }
 
       return sliced
+   }
+
+   private mergeMessage(current: any, update: UpdatePatch): any | null {
+      const patch = typeof update === 'function' ? update(current) : update
+      if (!patch || typeof patch !== 'object') return null
+
+      const merged: any = { ...current, ...patch }
+      if (current?.key || patch?.key) {
+         merged.key = { ...current?.key, ...patch?.key }
+      }
+      return this.cleanMessage(merged)
+   }
+
+   private mergeNode(current: any, update: UpdatePatch): any | null {
+      const patch = typeof update === 'function' ? update(current) : update
+      if (!patch || typeof patch !== 'object') return null
+
+      const merged: any = { ...current, ...patch }
+      if (current?.attrs || patch?.attrs) {
+         merged.attrs = { ...current?.attrs, ...patch?.attrs }
+      }
+      return this.sanitizeNode(merged)
+   }
+
+   private toSeconds(value: any): number {
+      if (value === null || value === undefined) return 0
+      const num = typeof value === 'object'
+         ? Number(typeof value.toNumber === 'function' ? value.toNumber() : (value.low ?? 0))
+         : Number(value)
+      if (!Number.isFinite(num) || num <= 0) return 0
+      return num > 1e12 ? Math.floor(num / 1000) : Math.floor(num)
+   }
+
+   private pruneMessageList(list: any[], options: CleanOptions = {}): any[] {
+      const limit = Math.max(0, options.keep ?? this.max)
+      const cutoff = options.maxAge && options.maxAge > 0 ? Math.floor((Date.now() - options.maxAge) / 1000) : 0
+      const seen = new Set<string>()
+      const result: any[] = []
+
+      for (let i = list.length - 1; i >= 0; i--) {
+         const msg = list[i]
+         if (!msg || typeof msg !== 'object') continue
+         const id = msg.key?.id || msg.id
+         if (!id || seen.has(id)) continue
+         const ts = this.toSeconds(msg.messageTimestamp)
+         if (cutoff && ts && ts < cutoff) continue
+         seen.add(id)
+         result.push(msg)
+      }
+
+      result.reverse()
+      return result.length > limit ? result.slice(result.length - limit) : result
+   }
+
+   private pruneNodeList(list: any[], options: CleanOptions = {}): any[] {
+      const limit = Math.max(0, options.keep ?? this.max)
+      const cutoff = options.maxAge && options.maxAge > 0 ? Math.floor((Date.now() - options.maxAge) / 1000) : 0
+      const seen = new Set<string>()
+      const result: any[] = []
+
+      for (let i = list.length - 1; i >= 0; i--) {
+         const node = list[i]
+         if (!node || typeof node !== 'object') continue
+         const id = node.attrs?.id || node.id
+         if (id) {
+            if (seen.has(id)) continue
+            seen.add(id)
+         }
+         const ts = this.toSeconds(node.attrs?.t)
+         if (cutoff && ts && ts < cutoff) continue
+         result.push(node)
+      }
+
+      result.reverse()
+      return result.length > limit ? result.slice(result.length - limit) : result
+   }
+
+   private pickStaleIds(rows: any[], limit: number, cutoff: number): string[] {
+      const stale: string[] = []
+      rows.forEach((row: any, idx: number) => {
+         if (idx >= limit || (cutoff && Number(row.created_at) < cutoff)) stale.push(row.id)
+      })
+      return stale
+   }
+
+   private replaceInNodeMemory(jid: string, id: string, merged: any): void {
+      const list = this.nodes[jid]
+      if (!Array.isArray(list)) return
+      const idx = list.findIndex((n: any) => (n?.attrs?.id || n?.id) === id)
+      if (idx !== -1) list[idx] = merged
+   }
+
+   private removeFromNodeMemory(jid: string, ids: Set<string>): void {
+      const list = this.nodes[jid]
+      if (!Array.isArray(list)) return
+      const filtered = list.filter((n: any) => !ids.has(n?.attrs?.id || n?.id))
+      if (filtered.length > 0) this.nodes[jid] = filtered
+      else delete this.nodes[jid]
+   }
+
+   private runExclusive<T>(queue: Map<string, Promise<any>>, key: string, task: () => Promise<T>): Promise<T> {
+      const previous = (queue.get(key) || Promise.resolve()).catch(() => { })
+      const result = previous.then(task)
+      const tail: Promise<any> = result.catch(() => { }).finally(() => {
+         if (queue.get(key) === tail) queue.delete(key)
+      })
+      queue.set(key, tail)
+      return result
+   }
+
+   private replaceInMessageCache(jid: string, id: string, merged: any): void {
+      const swap = (list?: any[]) => {
+         if (!Array.isArray(list)) return
+         const idx = list.findIndex((v: any) => v?.key?.id === id || v?.id === id)
+         if (idx !== -1) list[idx] = merged
+      }
+      swap(this.cache.get(jid))
+      swap(this.fallbackStore?.[jid])
+   }
+
+   private removeFromMessageCache(jid: string, ids: Set<string>): void {
+      const list = this.cache.get(jid)
+      if (!list) return
+      this.cache.set(jid, list.filter((v: any) => !ids.has(v?.key?.id || v?.id)))
+   }
+
+   public async updateMessage(jid: string, id: string, update: UpdatePatch): Promise<WAMessage | null> {
+      if (!jid || !id || !update) return null
+
+      return this.runExclusive(this.writeQueues, jid, async () => {
+         try {
+            const current = await this.loadMessage(jid, id)
+            if (!current) return null
+
+            const merged = this.mergeMessage(current, update)
+            if (!merged) return null
+
+            if (this.messagesCollection) {
+               await this.messagesCollection.updateOne({ jid, id }, { $set: { data: merged } })
+            }
+            this.replaceInMessageCache(jid, id, merged)
+            this.log('debug', `[updateMessage] Updated message ${colors.cyan}${id}${colors.reset} for ${colors.yellow}${jid}${colors.reset}`)
+            return merged
+         } catch (e: any) {
+            this.log('error', `Failed to update message ${id}:`, e?.message || e)
+            return null
+         }
+      })
+   }
+
+   public async updateNode(jid: string, id: string, update: UpdatePatch): Promise<any | null> {
+      if (!jid || !id || !update) return null
+
+      return this.runExclusive(this.nodeWriteQueues, jid, async () => {
+         try {
+            let current: any = this.nodes[jid]?.find((n: any) => (n?.attrs?.id || n?.id) === id) || null
+            if (!current && this.nodesCollection) {
+               const doc = await this.nodesCollection.findOne({ jid, id })
+               if (doc) current = doc.data
+            }
+            if (!current) return null
+
+            const merged = this.mergeNode(current, update)
+            if (!merged) return null
+
+            if (this.nodesCollection) {
+               const tag = merged.tag || current.tag || 'node'
+               await this.nodesCollection.updateOne({ jid, id }, { $set: { tag, data: merged } })
+            }
+            this.replaceInNodeMemory(jid, id, merged)
+            this.log('debug', `[updateNode] Updated node ${colors.cyan}${id}${colors.reset} for ${colors.yellow}${jid}${colors.reset}`)
+            return merged
+         } catch (e: any) {
+            this.log('error', `Failed to update node ${id}:`, e?.message || e)
+            return null
+         }
+      })
+   }
+
+   public async cleanMessages(jid?: string, options: CleanOptions = {}): Promise<number> {
+      const limit = Math.max(0, options.keep ?? this.max)
+      const cutoff = options.maxAge && options.maxAge > 0 ? Date.now() - options.maxAge : 0
+      let removed = 0
+
+      if (this.messagesCollection) {
+         let jids: string[] = []
+         try {
+            jids = jid ? [jid] : await this.messagesCollection.distinct('jid')
+         } catch (e: any) {
+            this.log('error', 'Failed to list JIDs for message cleanup:', e?.message || e)
+            return 0
+         }
+
+         for (const target of jids) {
+            removed += await this.runExclusive(this.writeQueues, target, async () => {
+               try {
+                  const found = await this.messagesCollection.find({ jid: target })
+                     .sort({ created_at: -1 })
+                     .project({ id: 1, created_at: 1 })
+                     .toArray()
+                  const stale = this.pickStaleIds(found, limit, cutoff)
+                  if (stale.length === 0) return 0
+
+                  for (let i = 0; i < stale.length; i += 500) {
+                     await this.messagesCollection.deleteMany({ jid: target, id: { $in: stale.slice(i, i + 500) } })
+                  }
+                  this.removeFromMessageCache(target, new Set(stale))
+                  return stale.length
+               } catch (e: any) {
+                  this.log('error', `Failed to clean messages for ${target}:`, e?.message || e)
+                  return 0
+               }
+            })
+         }
+
+         this.log('debug', `[cleanMessages] Removed ${colors.green}${removed}${colors.reset} messages from database.`)
+         return removed
+      }
+
+      if (this.fallbackStore) {
+         const targets = jid ? [jid] : Object.keys(this.fallbackStore)
+         for (const target of targets) {
+            const list = this.fallbackStore[target]
+            if (!Array.isArray(list)) continue
+            const cleaned = this.pruneMessageList(list, options)
+            const diff = list.length - cleaned.length
+            if (diff <= 0) continue
+            removed += diff
+            if (cleaned.length > 0) this.fallbackStore[target] = cleaned
+            else delete this.fallbackStore[target]
+         }
+      }
+      return removed
+   }
+
+   public async cleanNodes(jid?: string, options: CleanOptions = {}): Promise<number> {
+      const limit = Math.max(0, options.keep ?? this.max)
+      const cutoff = options.maxAge && options.maxAge > 0 ? Date.now() - options.maxAge : 0
+      let removed = 0
+
+      if (this.nodesCollection) {
+         let jids: string[] = []
+         try {
+            jids = jid ? [jid] : await this.nodesCollection.distinct('jid')
+         } catch (e: any) {
+            this.log('error', 'Failed to list JIDs for node cleanup:', e?.message || e)
+            return 0
+         }
+
+         for (const target of jids) {
+            removed += await this.runExclusive(this.nodeWriteQueues, target, async () => {
+               try {
+                  const found = await this.nodesCollection.find({ jid: target })
+                     .sort({ created_at: -1 })
+                     .project({ id: 1, created_at: 1 })
+                     .toArray()
+                  const stale = this.pickStaleIds(found, limit, cutoff)
+                  if (stale.length === 0) return 0
+
+                  for (let i = 0; i < stale.length; i += 500) {
+                     await this.nodesCollection.deleteMany({ jid: target, id: { $in: stale.slice(i, i + 500) } })
+                  }
+                  this.removeFromNodeMemory(target, new Set(stale))
+                  return stale.length
+               } catch (e: any) {
+                  this.log('error', `Failed to clean nodes for ${target}:`, e?.message || e)
+                  return 0
+               }
+            })
+         }
+
+         this.log('debug', `[cleanNodes] Removed ${colors.green}${removed}${colors.reset} nodes from database.`)
+         return removed
+      }
+
+      const targets = jid ? [jid] : Object.keys(this.nodes)
+      for (const target of targets) {
+         const list = this.nodes[target]
+         if (!Array.isArray(list)) continue
+         const cleaned = this.pruneNodeList(list, options)
+         const diff = list.length - cleaned.length
+         if (diff <= 0) continue
+         removed += diff
+         if (cleaned.length > 0) this.nodes[target] = cleaned
+         else delete this.nodes[target]
+      }
+      return removed
    }
 
    public chatUpdate(updates: any[]): void {

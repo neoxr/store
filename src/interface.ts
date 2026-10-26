@@ -16,6 +16,13 @@ export interface WAMessage {
    [key: string]: any
 }
 
+export type UpdatePatch = Record<string, any> | ((current: any) => any)
+
+export interface CleanOptions {
+   maxAge?: number
+   keep?: number
+}
+
 export interface StoreConfig {
    dir?: string
    max?: number
@@ -62,11 +69,15 @@ export interface Client {
    loadMessages?: (jid: string, count?: number) => WAMessage[] | Promise<WAMessage[] | null> | null
    addMessage?: (jid: string, msg: WAMessage) => void | Promise<void>
    getAllMessages?: (jid: string, offset?: number) => any
+   updateMessage?: (jid: string, id: string, update: UpdatePatch) => WAMessage | Promise<WAMessage | null> | null
+   cleanMessages?: (jid?: string, options?: CleanOptions) => number | Promise<number>
 
    loadNode?: (jid: string, id: string) => BinaryNode | Promise<BinaryNode | null> | null | any
    loadNodes?: (jid: string, count?: number) => BinaryNode[] | Promise<BinaryNode[] | null> | null | any
    addNode?: (node: BinaryNode | any, customJid?: string) => void | Promise<void>
    getAllNodes?: (jid: string, offset?: number) => any
+   updateNode?: (jid: string, id: string, update: UpdatePatch) => BinaryNode | Promise<BinaryNode | null> | null | any
+   cleanNodes?: (jid?: string, options?: CleanOptions) => number | Promise<number>
 
    chats?: Record<string, any>
    contacts?: Record<string, any>

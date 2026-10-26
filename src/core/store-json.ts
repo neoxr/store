@@ -1,4 +1,4 @@
-import { type Contact, type ConnectionState, type PresenceData, Client, WAMessage, StoreConfig } from '../interface.js'
+import { type Contact, type ConnectionState, type PresenceData, Client, WAMessage, StoreConfig, type CleanOptions, type UpdatePatch } from '../interface.js'
 import fs from 'node:fs'
 import path from 'node:path'
 import { noSuffix, getKeyAuthor } from '../utils.js'
@@ -655,6 +655,8 @@ class Store {
       safeAssign(client, 'loadMessages', this.loadMessages.bind(this))
       safeAssign(client, 'addMessage', this.addMessage.bind(this))
       safeAssign(client, 'getAllMessages', this.getAllMessages.bind(this))
+      safeAssign(client, 'updateMessage', this.updateMessage.bind(this))
+      safeAssign(client, 'cleanMessages', this.cleanMessages.bind(this))
 
       safeAssign(client, 'chatUpdate', this.chatUpdate.bind(this))
       safeAssign(client, 'contactsUpsert', this.contactsUpsert.bind(this))
@@ -680,6 +682,8 @@ class Store {
       safeAssign(client, 'loadNode', this.loadNode.bind(this))
       safeAssign(client, 'loadNodes', this.loadNodes.bind(this))
       safeAssign(client, 'getAllNodes', this.getAllNodes.bind(this))
+      safeAssign(client, 'updateNode', this.updateNode.bind(this))
+      safeAssign(client, 'cleanNodes', this.cleanNodes.bind(this))
 
       safeAssign(client, 'contacts', this.contacts)
       safeAssign(client, 'stories', this.stories)
@@ -1051,6 +1055,194 @@ class Store {
       }
 
       return sliced
+   }
+
+   private mergeMessage(current: any, update: UpdatePatch): any | null {
+      const patch = typeof update === 'function' ? update(current) : update
+      if (!patch || typeof patch !== 'object') return null
+
+      const merged: any = { ...current, ...patch }
+      if (current?.key || patch?.key) {
+         merged.key = { ...current?.key, ...patch?.key }
+      }
+      return this.cleanMessage(merged)
+   }
+
+   private mergeNode(current: any, update: UpdatePatch): any | null {
+      const patch = typeof update === 'function' ? update(current) : update
+      if (!patch || typeof patch !== 'object') return null
+
+      const merged: any = { ...current, ...patch }
+      if (current?.attrs || patch?.attrs) {
+         merged.attrs = { ...current?.attrs, ...patch?.attrs }
+      }
+      return this.sanitizeNode(merged)
+   }
+
+   private toSeconds(value: any): number {
+      if (value === null || value === undefined) return 0
+      const num = typeof value === 'object'
+         ? Number(typeof value.toNumber === 'function' ? value.toNumber() : (value.low ?? 0))
+         : Number(value)
+      if (!Number.isFinite(num) || num <= 0) return 0
+      return num > 1e12 ? Math.floor(num / 1000) : Math.floor(num)
+   }
+
+   private pruneMessageList(list: any[], options: CleanOptions = {}): any[] {
+      const limit = Math.max(0, options.keep ?? this.max)
+      const cutoff = options.maxAge && options.maxAge > 0 ? Math.floor((Date.now() - options.maxAge) / 1000) : 0
+      const seen = new Set<string>()
+      const result: any[] = []
+
+      for (let i = list.length - 1; i >= 0; i--) {
+         const msg = list[i]
+         if (!msg || typeof msg !== 'object') continue
+         const id = msg.key?.id || msg.id
+         if (!id || seen.has(id)) continue
+         const ts = this.toSeconds(msg.messageTimestamp)
+         if (cutoff && ts && ts < cutoff) continue
+         seen.add(id)
+         result.push(msg)
+      }
+
+      result.reverse()
+      return result.length > limit ? result.slice(result.length - limit) : result
+   }
+
+   private pruneNodeList(list: any[], options: CleanOptions = {}): any[] {
+      const limit = Math.max(0, options.keep ?? this.max)
+      const cutoff = options.maxAge && options.maxAge > 0 ? Math.floor((Date.now() - options.maxAge) / 1000) : 0
+      const seen = new Set<string>()
+      const result: any[] = []
+
+      for (let i = list.length - 1; i >= 0; i--) {
+         const node = list[i]
+         if (!node || typeof node !== 'object') continue
+         const id = node.attrs?.id || node.id
+         if (id) {
+            if (seen.has(id)) continue
+            seen.add(id)
+         }
+         const ts = this.toSeconds(node.attrs?.t)
+         if (cutoff && ts && ts < cutoff) continue
+         result.push(node)
+      }
+
+      result.reverse()
+      return result.length > limit ? result.slice(result.length - limit) : result
+   }
+
+   public updateMessage(jid: string, id: string, update: UpdatePatch): WAMessage | null {
+      if (!jid || !id || !update) return null
+
+      const list = this.readJidData(jid)
+      const idx = list.findIndex(v => v?.key?.id === id || (v as any)?.id === id)
+      if (idx === -1) return null
+
+      const merged = this.mergeMessage(list[idx], update)
+      if (!merged) return null
+
+      list[idx] = merged
+      this.writeJidData(jid, list)
+      this.log('debug', `[updateMessage] Updated message ${colors.cyan}${id}${colors.reset} for ${colors.yellow}${jid}${colors.reset}`)
+      return merged
+   }
+
+   public updateNode(jid: string, id: string, update: UpdatePatch): any | null {
+      if (!jid || !id || !update) return null
+
+      const list = this.nodes[jid]
+      if (!Array.isArray(list)) return null
+      const idx = list.findIndex((n: any) => (n?.attrs?.id || n?.id) === id)
+      if (idx === -1) return null
+
+      const merged = this.mergeNode(list[idx], update)
+      if (!merged) return null
+
+      list[idx] = merged
+      this.writeNodesData()
+      this.log('debug', `[updateNode] Updated node ${colors.cyan}${id}${colors.reset} for ${colors.yellow}${jid}${colors.reset}`)
+      return merged
+   }
+
+   public cleanMessages(jid?: string, options: CleanOptions = {}): number {
+      let removed = 0
+
+      if (jid) {
+         const list = this.readJidData(jid)
+         const cleaned = this.pruneMessageList(list, options)
+         const diff = list.length - cleaned.length
+         if (diff > 0) {
+            this.writeJidData(jid, cleaned)
+            removed += diff
+         }
+         this.log('debug', `[cleanMessages] Removed ${colors.green}${removed}${colors.reset} messages for ${colors.yellow}${jid}${colors.reset}`)
+         return removed
+      }
+
+      const reserved = new Set(['chats', 'contacts', 'group_metadata', 'stories', 'nodes'])
+      const handled = new Set<string>()
+
+      for (const cachedJid of [...this.cache.keys()]) {
+         handled.add(this.getFilePath(cachedJid))
+         removed += this.cleanMessages(cachedJid, options)
+      }
+
+      let files: string[] = []
+      try {
+         files = fs.readdirSync(this.storeDir)
+      } catch { }
+
+      for (const file of files) {
+         if (!file.endsWith('.json')) continue
+         if (reserved.has(file.slice(0, -5))) continue
+
+         const filePath = path.join(this.storeDir, file)
+         if (handled.has(filePath)) continue
+
+         try {
+            const list = parse(fs.readFileSync(filePath, 'utf-8'))
+            if (!Array.isArray(list)) continue
+
+            const cleaned = this.pruneMessageList(list, options)
+            const diff = list.length - cleaned.length
+            if (diff <= 0) continue
+            removed += diff
+
+            if (cleaned.length === 0) {
+               fs.unlinkSync(filePath)
+            } else {
+               const tempPath = `${filePath}.tmp`
+               fs.writeFileSync(tempPath, stringify(cleaned.map(v => this.toPOJO(v))), 'utf-8')
+               fs.renameSync(tempPath, filePath)
+            }
+         } catch (error) {
+            this.log('error', `Failed to clean messages file ${file}:`, error)
+         }
+      }
+
+      this.log('debug', `[cleanMessages] Removed ${colors.green}${removed}${colors.reset} messages in total.`)
+      return removed
+   }
+
+   public cleanNodes(jid?: string, options: CleanOptions = {}): number {
+      let removed = 0
+
+      const targets = jid ? [jid] : Object.keys(this.nodes)
+      for (const target of targets) {
+         const list = this.nodes[target]
+         if (!Array.isArray(list)) continue
+         const cleaned = this.pruneNodeList(list, options)
+         const diff = list.length - cleaned.length
+         if (diff <= 0) continue
+         removed += diff
+         if (cleaned.length > 0) this.nodes[target] = cleaned
+         else delete this.nodes[target]
+      }
+
+      if (removed > 0) this.writeNodesData()
+      this.log('debug', `[cleanNodes] Removed ${colors.green}${removed}${colors.reset} nodes.`)
+      return removed
    }
 
    public chatUpdate(updates: any[]): void {

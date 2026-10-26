@@ -1,4 +1,4 @@
-import { type Contact, type ConnectionState, type PresenceData, Client, WAMessage, StoreConfig } from '../interface.js'
+import { type Contact, type ConnectionState, type PresenceData, Client, WAMessage, StoreConfig, type CleanOptions, type UpdatePatch } from '../interface.js'
 import path from 'node:path'
 import { noSuffix, getKeyAuthor } from '../utils.js'
 
@@ -508,6 +508,8 @@ class Store {
       safeAssign(client, 'loadMessages', this.loadMessages.bind(this))
       safeAssign(client, 'addMessage', this.addMessage.bind(this))
       safeAssign(client, 'getAllMessages', this.getAllMessages.bind(this))
+      safeAssign(client, 'updateMessage', this.updateMessage.bind(this))
+      safeAssign(client, 'cleanMessages', this.cleanMessages.bind(this))
 
       safeAssign(client, 'chatUpdate', this.chatUpdate.bind(this))
       safeAssign(client, 'contactsUpsert', this.contactsUpsert.bind(this))
@@ -533,6 +535,8 @@ class Store {
       safeAssign(client, 'loadNode', this.loadNode.bind(this))
       safeAssign(client, 'loadNodes', this.loadNodes.bind(this))
       safeAssign(client, 'getAllNodes', this.getAllNodes.bind(this))
+      safeAssign(client, 'updateNode', this.updateNode.bind(this))
+      safeAssign(client, 'cleanNodes', this.cleanNodes.bind(this))
 
       safeAssign(client, 'contacts', this.contacts)
       safeAssign(client, 'stories', this.stories)
@@ -1118,6 +1122,275 @@ class Store {
       }
 
       return promiseWithMethods
+   }
+
+   private mergeMessage(current: any, update: UpdatePatch): any | null {
+      const patch = typeof update === 'function' ? update(current) : update
+      if (!patch || typeof patch !== 'object') return null
+
+      const merged: any = { ...current, ...patch }
+      if (current?.key || patch?.key) {
+         merged.key = { ...current?.key, ...patch?.key }
+      }
+      return this.cleanMessage(merged)
+   }
+
+   private mergeNode(current: any, update: UpdatePatch): any | null {
+      const patch = typeof update === 'function' ? update(current) : update
+      if (!patch || typeof patch !== 'object') return null
+
+      const merged: any = { ...current, ...patch }
+      if (current?.attrs || patch?.attrs) {
+         merged.attrs = { ...current?.attrs, ...patch?.attrs }
+      }
+      return this.sanitizeNode(merged)
+   }
+
+   private toSeconds(value: any): number {
+      if (value === null || value === undefined) return 0
+      const num = typeof value === 'object'
+         ? Number(typeof value.toNumber === 'function' ? value.toNumber() : (value.low ?? 0))
+         : Number(value)
+      if (!Number.isFinite(num) || num <= 0) return 0
+      return num > 1e12 ? Math.floor(num / 1000) : Math.floor(num)
+   }
+
+   private pruneMessageList(list: any[], options: CleanOptions = {}): any[] {
+      const limit = Math.max(0, options.keep ?? this.max)
+      const cutoff = options.maxAge && options.maxAge > 0 ? Math.floor((Date.now() - options.maxAge) / 1000) : 0
+      const seen = new Set<string>()
+      const result: any[] = []
+
+      for (let i = list.length - 1; i >= 0; i--) {
+         const msg = list[i]
+         if (!msg || typeof msg !== 'object') continue
+         const id = msg.key?.id || msg.id
+         if (!id || seen.has(id)) continue
+         const ts = this.toSeconds(msg.messageTimestamp)
+         if (cutoff && ts && ts < cutoff) continue
+         seen.add(id)
+         result.push(msg)
+      }
+
+      result.reverse()
+      return result.length > limit ? result.slice(result.length - limit) : result
+   }
+
+   private pruneNodeList(list: any[], options: CleanOptions = {}): any[] {
+      const limit = Math.max(0, options.keep ?? this.max)
+      const cutoff = options.maxAge && options.maxAge > 0 ? Math.floor((Date.now() - options.maxAge) / 1000) : 0
+      const seen = new Set<string>()
+      const result: any[] = []
+
+      for (let i = list.length - 1; i >= 0; i--) {
+         const node = list[i]
+         if (!node || typeof node !== 'object') continue
+         const id = node.attrs?.id || node.id
+         if (id) {
+            if (seen.has(id)) continue
+            seen.add(id)
+         }
+         const ts = this.toSeconds(node.attrs?.t)
+         if (cutoff && ts && ts < cutoff) continue
+         result.push(node)
+      }
+
+      result.reverse()
+      return result.length > limit ? result.slice(result.length - limit) : result
+   }
+
+   private async scanKeys(pattern: string): Promise<string[]> {
+      const found: string[] = []
+      if (!this.redis) return found
+
+      let cursor: any = '0'
+      do {
+         const reply: any = await this.redis.scan(cursor, { MATCH: pattern, COUNT: 500 })
+         cursor = reply.cursor
+         if (Array.isArray(reply.keys)) found.push(...reply.keys)
+      } while (String(cursor) !== '0')
+
+      return found
+   }
+
+   private persistNodes(jid: string): void {
+      if (!this.redis) return
+
+      const previous = (this.nodeWriteQueues.get(jid) || Promise.resolve()).catch(() => { })
+      const current = previous
+         .then(async () => {
+            try {
+               const list = this.nodes[jid]
+               if (Array.isArray(list) && list.length > 0) {
+                  await this.redis.set(`node_store:${jid}`, stringify(list))
+               } else {
+                  await this.redis.del(`node_store:${jid}`)
+               }
+            } catch (e: any) {
+               this.log('error', `Failed to persist nodes for ${jid}:`, e?.message || e)
+            }
+         })
+         .finally(() => {
+            if (this.nodeWriteQueues.get(jid) === current) {
+               this.nodeWriteQueues.delete(jid)
+            }
+         })
+      this.nodeWriteQueues.set(jid, current)
+   }
+
+   private async loadNodeList(jid: string): Promise<any[] | null> {
+      if (Array.isArray(this.nodes[jid])) return this.nodes[jid]
+      if (!this.redis) return null
+
+      try {
+         const raw = await this.redis.get(`node_store:${jid}`)
+         if (!raw) return null
+         const list = parse(raw)
+         if (!Array.isArray(list)) return null
+         this.nodes[jid] = list
+         return list
+      } catch {
+         return null
+      }
+   }
+
+   public async updateMessage(jid: string, id: string, update: UpdatePatch): Promise<WAMessage | null> {
+      if (!jid || !id || !update) return null
+
+      try {
+         const list = this.redis ? await this.getRedisData(jid) : (this.fallbackStore?.[jid] || [])
+         const idx = list.findIndex((v: any) => v?.key?.id === id || v?.id === id)
+         if (idx === -1) return null
+
+         const merged = this.mergeMessage(list[idx], update)
+         if (!merged) return null
+
+         list[idx] = merged
+         if (this.redis) await this.setRedisData(jid, list)
+
+         this.log('debug', `[updateMessage] Updated message ${colors.cyan}${id}${colors.reset} for ${colors.yellow}${jid}${colors.reset}`)
+         return merged
+      } catch (e: any) {
+         this.log('error', `Failed to update message ${id}:`, e?.message || e)
+         return null
+      }
+   }
+
+   public async updateNode(jid: string, id: string, update: UpdatePatch): Promise<any | null> {
+      if (!jid || !id || !update) return null
+
+      try {
+         const list = await this.loadNodeList(jid)
+         if (!list) return null
+
+         const idx = list.findIndex((n: any) => (n?.attrs?.id || n?.id) === id)
+         if (idx === -1) return null
+
+         const merged = this.mergeNode(list[idx], update)
+         if (!merged) return null
+
+         list[idx] = merged
+         this.persistNodes(jid)
+
+         this.log('debug', `[updateNode] Updated node ${colors.cyan}${id}${colors.reset} for ${colors.yellow}${jid}${colors.reset}`)
+         return merged
+      } catch (e: any) {
+         this.log('error', `Failed to update node ${id}:`, e?.message || e)
+         return null
+      }
+   }
+
+   public async cleanMessages(jid?: string, options: CleanOptions = {}): Promise<number> {
+      let removed = 0
+      const targets = new Set<string>()
+
+      if (jid) {
+         targets.add(jid)
+      } else {
+         for (const key of this.cache.keys()) targets.add(key)
+         if (this.fallbackStore) {
+            for (const key of Object.keys(this.fallbackStore)) targets.add(key)
+         }
+         try {
+            for (const key of await this.scanKeys('msg_store:*')) {
+               targets.add(key.slice('msg_store:'.length))
+            }
+         } catch (e: any) {
+            this.log('error', 'Failed to scan message keys:', e?.message || e)
+         }
+      }
+
+      for (const target of targets) {
+         try {
+            if (this.redis) {
+               const list = await this.getRedisData(target)
+               const cleaned = this.pruneMessageList(list, options)
+               const diff = list.length - cleaned.length
+               if (diff <= 0) continue
+               removed += diff
+
+               if (cleaned.length === 0) {
+                  this.pendingJidWrites.delete(target)
+                  this.cache.delete(target)
+                  await this.redis.del(`msg_store:${target}`)
+               } else {
+                  await this.setRedisData(target, cleaned)
+               }
+            } else if (this.fallbackStore?.[target]) {
+               const list = this.fallbackStore[target]
+               const cleaned = this.pruneMessageList(list, options)
+               const diff = list.length - cleaned.length
+               if (diff <= 0) continue
+               removed += diff
+               if (cleaned.length > 0) this.fallbackStore[target] = cleaned
+               else delete this.fallbackStore[target]
+            }
+         } catch (e: any) {
+            this.log('error', `Failed to clean messages for ${target}:`, e?.message || e)
+         }
+      }
+
+      this.log('debug', `[cleanMessages] Removed ${colors.green}${removed}${colors.reset} messages.`)
+      return removed
+   }
+
+   public async cleanNodes(jid?: string, options: CleanOptions = {}): Promise<number> {
+      let removed = 0
+      const targets = new Set<string>()
+
+      if (jid) {
+         targets.add(jid)
+      } else {
+         for (const key of Object.keys(this.nodes)) targets.add(key)
+         try {
+            for (const key of await this.scanKeys('node_store:*')) {
+               targets.add(key.slice('node_store:'.length))
+            }
+         } catch (e: any) {
+            this.log('error', 'Failed to scan node keys:', e?.message || e)
+         }
+      }
+
+      for (const target of targets) {
+         try {
+            const list = await this.loadNodeList(target)
+            if (!list) continue
+
+            const cleaned = this.pruneNodeList(list, options)
+            const diff = list.length - cleaned.length
+            if (diff <= 0) continue
+            removed += diff
+
+            if (cleaned.length > 0) this.nodes[target] = cleaned
+            else delete this.nodes[target]
+            this.persistNodes(target)
+         } catch (e: any) {
+            this.log('error', `Failed to clean nodes for ${target}:`, e?.message || e)
+         }
+      }
+
+      this.log('debug', `[cleanNodes] Removed ${colors.green}${removed}${colors.reset} nodes.`)
+      return removed
    }
 
    public chatUpdate(updates: any[]): void {
